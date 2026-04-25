@@ -3,8 +3,8 @@ import requests
 
 app = FastAPI()
 
-BOT_TOKEN = "7858398114:AAF6p9Z1MctcEbYKpklFK6rCyPfYzBgFXVc"
-CHAT_ID = "8302501867"
+BOT_TOKEN = "AAFV9kM7jAJhju4Y3adHzndwCTM6lA62HMc"
+CHAT_ID ="8302501867"
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -30,5 +30,4 @@ async def webhook(req: Request):
     )
 
     send_message(text)
-
     return {"ok": True}
