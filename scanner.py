@@ -40,6 +40,7 @@ ATR_ABS_THRESHOLDS = {
 SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
 REPORT_INTERVAL_SEC = 15 * 60        # тест: сводный отчёт раз в 15 минут
 ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
+NEAR_ZONE_COOLDOWN_SEC = 30 * 60     # кулдаун NEAR_ZONE на актив
 
 # Funding — контекст, не блок
 FUNDING_LONG_RISK = 0.0003           # > +0.03% — long под вопросом
@@ -58,10 +59,13 @@ INTERVAL_MS = {
 
 _state = {
     "last_zone_hit_at": {a: 0.0 for a in ASSETS},
+    "last_near_zone_at": {a: 0.0 for a in ASSETS},
     "last_report_at": 0.0,
     # ключи зон, где цена уже была внутри на прошлом цикле;
     # нужно, чтобы ZONE HIT срабатывал именно на входе в зону, а не каждые 30 минут
     "inside_zone_keys": set(),
+    # ключи зон, где цена была "near" (в пределах 0.5 ATR от границы), но снаружи
+    "near_zone_keys": set(),
     "thread": None,
 }
 _state_lock = threading.Lock()
@@ -410,6 +414,7 @@ def analyse_asset(coin, fundings):
     rsi_1h_series = rsi(closes_1h, 14)
 
     price = closes_1h[-1]
+    atr_1h = atr_1h_series[-1] if atr_1h_series else None
 
     regime_4h, dir_4h = classify_regime_4h(candles_4h, atr_4h_series, ema20_4h, ema50_4h)
     dir_1h = trend_1h(candles_1h, ema20_1h, ema50_1h)
@@ -508,6 +513,7 @@ def analyse_asset(coin, fundings):
         "trend_aligned": trend_aligned,
         "atr_mode": a_mode,
         "atr_pct_1h": atr_pct_1h,
+        "atr_1h": atr_1h,
         "rsi_1h": rsi_val,
         "rsi_dir": rsi_dir,
         "funding": funding,
@@ -630,6 +636,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
             fundings = fetch_funding()
             rows = []
             current_inside_zone_keys = set()
+            current_near_zone_keys = set()
             for coin in ASSETS:
                 try:
                     r = analyse_asset(coin, fundings)
@@ -668,8 +675,51 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                                  + (" ⚠️ funding" if r['funding_risk'] else ""))
                             )
 
+                # NEAR_ZONE: цена близко к зоне (<= 0.5 ATR(1H)), но НЕ внутри. Только Telegram, без webhook.
+                if (
+                    r
+                    and (not r.get("inside"))
+                    and r.get("best_zone") is not None
+                    and r.get("atr_mode") != "EXTREME"
+                ):
+                    z = r["best_zone"]
+                    atr_1h = r.get("atr_1h")
+                    price = r.get("price")
+                    if atr_1h is not None and atr_1h > 0 and price is not None:
+                        if price < z["low"]:
+                            edge_dist = z["low"] - price
+                        elif price > z["high"]:
+                            edge_dist = price - z["high"]
+                        else:
+                            edge_dist = None
+
+                        if edge_dist is not None and edge_dist <= 0.5 * atr_1h:
+                            zone_key = f"{coin}:{z['direction']}:{round(z['low'], 4)}:{round(z['high'], 4)}"
+                            current_near_zone_keys.add(zone_key)
+
+                            now = time.time()
+                            with _state_lock:
+                                last = _state["last_near_zone_at"].get(coin, 0.0)
+                                already_near = zone_key in _state.get("near_zone_keys", set())
+
+                            # Сигнал только на "входе" в near-band + кулдаун
+                            if (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
+                                with _state_lock:
+                                    _state["last_near_zone_at"][coin] = now
+                                dist_pct = (edge_dist / price) if price > 0 else 0.0
+                                send_telegram(
+                                    telegram_token, chat_id,
+                                    (f"👀 <b>NEAR ZONE</b> {coin} "
+                                     f"{z['direction']} @ {_fmt_price(price)} "
+                                     f"→ {z['grade']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])} "
+                                     f"dist {_fmt_price(edge_dist)} (~{dist_pct * 100:.2f}%) "
+                                     f"(0.5 ATR≈{_fmt_price(0.5 * atr_1h)})"
+                                     + (" ⚠️ funding" if r.get("funding_risk") else ""))
+                                )
+
             with _state_lock:
                 _state["inside_zone_keys"] = current_inside_zone_keys
+                _state["near_zone_keys"] = current_near_zone_keys
 
             now = time.time()
             with _state_lock:
