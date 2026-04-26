@@ -282,9 +282,23 @@ def calculate_trade(asset: str, side: str, entry: float, stop: float,
 def build_calc_message(r: dict, trade_id: str = "") -> str:
     if not r["ok"]:
         return f"🚫 ОШИБКА\n\nПричина: {r['reason']}"
-    status = "✅ Вход разрешён" if r["allowed"] else f"❌ Запрещён — RR {r['rr']:.2f} < 2.3"
+    status = (
+        "✅ RR OK — сделка разрешена только если реакция подтверждена"
+        if r["allowed"]
+        else "❌ RR FAIL — вход запрещён"
+    )
     warns  = ("\n\n" + "\n".join(f"⚠️ {w}" for w in r["warnings"])) if r["warnings"] else ""
     id_ln  = f"\nID: {trade_id}" if trade_id else ""
+    rules = (
+        "\n\nПравила:\n"
+        "A+ = только reaction 3/3\n"
+        "B = максимум reaction 2/3, риск 0.5%\n"
+        "Стоп должен быть за зоной или экстремумом реакции\n"
+        "Тейк — ближайшая ликвидность или RR ≥ 2.3"
+        if r["allowed"]
+        else "\n\nНе улучшай сделку эмоциями, не двигай стоп ближе ради красивого RR\n"
+             "Либо жди лучший вход, либо пропусти сетап"
+    )
     hint   = "\n\nПосле сделки: /sl (стоп) или /win X (профит)" if r["allowed"] else ""
     return (
         f"📊 {r['asset']} {r['side']} | {r['grade']}{id_ln}\n\n"
@@ -295,7 +309,7 @@ def build_calc_message(r: dict, trade_id: str = "") -> str:
         f"Позиция: ${r['pos_usd']:.0f}\n"
         f"Плечо:   {r['lev']}x\n"
         f"RR:      1:{r['rr']:.2f}\n\n"
-        f"{status}{warns}{hint}"
+        f"{status}{rules}{warns}{hint}"
     )
 
 
