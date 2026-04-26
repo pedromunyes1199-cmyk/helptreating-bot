@@ -555,10 +555,34 @@ def evaluate_setup(asset_row):
     if smart_status not in SMART_STATUSES:
         smart_status = "IGNORE"
 
+    coin = asset_row.get("coin")
+    priority_rank = 0
+    if setup_grade == "A+":
+        if coin == "BTC":
+            priority_rank = 1
+        elif coin == "ETH":
+            priority_rank = 2
+        elif coin == "SOL":
+            priority_rank = 3
+    elif setup_grade == "B":
+        if coin == "BTC":
+            priority_rank = 4
+        elif coin == "ETH":
+            priority_rank = 5
+        elif coin == "SOL":
+            priority_rank = 6
+
+    if priority_rank > 0 and coin in ("BTC", "ETH", "SOL"):
+        priority_label = f"Priority #{priority_rank} — {coin} {setup_grade}"
+    else:
+        priority_label = "No priority — IGNORE"
+
     asset_row["setup_grade"] = setup_grade
     asset_row["smart_status"] = smart_status
     asset_row["reasons"] = reasons
     asset_row["priority_score"] = priority_score
+    asset_row["priority_rank"] = int(priority_rank)
+    asset_row["priority_label"] = priority_label
     asset_row["proximity"] = proximity
     asset_row["edge_dist"] = edge_dist
     asset_row["near_band"] = near_band
@@ -716,7 +740,7 @@ def format_report(rows):
             f"Status: <b>{smart}</b>\n"
             f"Reasons:\n{reasons_lines}\n"
             f"Zone:\n" + "\n".join(zone_lines) + "\n"
-            f"Priority:\n- {int(r.get('priority_score', 0))}"
+            f"Priority: {r.get('priority_label', 'No priority — IGNORE')}"
         )
     return "\n".join(lines)
 
@@ -816,12 +840,20 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                                 _state["last_zone_hit_at"][coin] = now
                             send_telegram(
                                 telegram_token, chat_id,
-                                (f"<b>ZONE HIT</b>\n"
-                                 f"{coin} @ {_fmt_price(r['price'])}\n"
+                                (f"🔥 <b>ZONE HIT — смотри реакцию</b>\n"
+                                 f"{coin} {z['direction']}\n"
                                  f"Setup: <b>{r.get('setup_grade', 'IGNORE')}</b>\n"
-                                 f"Status: <b>{r.get('smart_status', 'IGNORE')}</b>\n"
-                                 f"Priority:\n- {int(r.get('priority_score', 0))}\n"
-                                 f"Zone:\n- {z['direction']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])}")
+                                 f"{r.get('priority_label', 'No priority — IGNORE')}\n"
+                                 f"Price: {_fmt_price(r.get('price'))}\n"
+                                 f"Zone: {_fmt_price(z['low'])}–{_fmt_price(z['high'])}\n"
+                                 f"ATR mode: {r.get('atr_mode', 'UNKNOWN')}\n"
+                                 f"RSI dir: {r.get('rsi_dir', 'FLAT')}\n"
+                                 f"Funding risk: {'YES ⚠️' if r.get('funding_risk') else 'NO'}\n"
+                                 f"\n<b>Правило</b>:\n"
+                                 f"- A+ только при реакции 3/3\n"
+                                 f"- B максимум при реакции 2/3\n"
+                                 f"- После реакции отправь: entry ... stop ... take ...\n"
+                                 f"- Бот проверит RR ≥ 2.3")
                             )
 
                 # NEAR_ZONE: цена близко к зоне (<= 0.5 ATR(1H)), но НЕ внутри. Только Telegram, без webhook.
@@ -850,14 +882,18 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         dist_pct = (edge_dist / price) if (edge_dist is not None and price and price > 0) else 0.0
                         send_telegram(
                             telegram_token, chat_id,
-                            (f"<b>NEAR ZONE</b>\n"
-                             f"{coin} @ {_fmt_price(price)}\n"
+                            (f"🟡 <b>NEAR ZONE — готовься, НЕ вход</b>\n"
+                             f"{coin} {z['direction']}\n"
                              f"Setup: <b>{r.get('setup_grade', 'IGNORE')}</b>\n"
-                             f"Status: <b>{r.get('smart_status', 'IGNORE')}</b>\n"
-                             f"Reasons:\n" + ("\n".join(f"- {x}" for x in (r.get("reasons") or [])[:6]) or "- —") + "\n"
-                             f"Zone:\n- {z['direction']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])}\n"
-                             f"Priority:\n- {int(r.get('priority_score', 0))}\n"
-                             f"Distance:\n- {_fmt_price(edge_dist)} (~{dist_pct * 100:.2f}%)  near_band(0.5 ATR): {_fmt_price(near_band)}")
+                             f"{r.get('priority_label', 'No priority — IGNORE')}\n"
+                             f"Price: {_fmt_price(price)}\n"
+                             f"Zone: {_fmt_price(z['low'])}–{_fmt_price(z['high'])}\n"
+                             f"Distance: {_fmt_price(edge_dist)} (~{dist_pct * 100:.2f}%)\n"
+                             f"ATR mode: {r.get('atr_mode', 'UNKNOWN')}\n"
+                             f"RSI dir: {r.get('rsi_dir', 'FLAT')}\n"
+                             f"Funding risk: {'YES ⚠️' if r.get('funding_risk') else 'NO'}\n"
+                             f"\n<b>Правило</b>:\n"
+                             f"- Вход запрещён. Жди ZONE HIT + реакцию.")
                         )
 
             with _state_lock:
