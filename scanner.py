@@ -37,8 +37,8 @@ ATR_ABS_THRESHOLDS = {
     "SOL": 0.030,
 }
 
-SCAN_INTERVAL_SEC = 30 * 60          # цикл сканера — раз в 30 минут
-REPORT_INTERVAL_SEC = 4 * 60 * 60    # сводный отчёт — раз в 4 часа
+SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
+REPORT_INTERVAL_SEC = 15 * 60        # тест: сводный отчёт раз в 15 минут
 ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
 
 # Funding — контекст, не блок
@@ -620,10 +620,9 @@ def fire_zone_hit(self_webhook_url, asset_row):
 
 def _scanner_loop(telegram_token, chat_id, self_webhook_url):
     print("[scanner] v2 loop started")
-    # Первый отчёт — через REPORT_INTERVAL_SEC после старта,
-    # чтобы не спамить при каждом перезапуске Railway.
+    # Первый отчёт сразу после старта — чтобы видеть, что сканер живой.
     with _state_lock:
-        _state["last_report_at"] = time.time()
+        _state["last_report_at"] = 0.0
 
     while True:
         cycle_start = time.time()
