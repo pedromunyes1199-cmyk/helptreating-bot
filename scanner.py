@@ -69,6 +69,8 @@ _state = {
     "inside_zone_keys": set(),
     # ключи зон, где цена была "near" (в пределах 0.5 ATR от границы), но снаружи
     "near_zone_keys": set(),
+    # защита от ложных ZONE_HIT/NEAR_ZONE после рестарта: первый цикл только прогревает state
+    "warmup_done": False,
     "thread": None,
 }
 _state_lock = threading.Lock()
@@ -110,6 +112,7 @@ def fetch_candles(coin, interval, lookback_bars):
             })
         except (KeyError, TypeError, ValueError):
             continue
+    out.sort(key=lambda x: x["t"])
     return out
 
 
@@ -239,7 +242,9 @@ def atr_mode(coin, atr_1h_series, price):
     cur = atr_1h_series[-1]
     cur_pct = cur / price
     abs_thr = ATR_ABS_THRESHOLDS.get(coin, 0.02)
-    valid = [v for v in atr_1h_series[-480:] if v is not None]
+    # Средний ATR сравнения — без текущего последнего ATR (чтобы не "сам с собой").
+    hist = atr_1h_series[-481:-1] if len(atr_1h_series) >= 2 else []
+    valid = [v for v in hist[-480:] if v is not None]
     mean_atr = sum(valid) / len(valid) if valid else cur
     ratio = cur / mean_atr if mean_atr > 0 else 1.0
     if cur_pct > abs_thr * 1.5 or ratio > 2.5:
@@ -304,7 +309,7 @@ def find_zones(candles_4h, atr_4h):
         # Не считаем импульсную свечу и не считаем последнюю 4H-свечу,
         # потому что она может быть ещё не закрыта. Иначе текущий вход в зону
         # сразу ухудшает grade.
-        for j in range(i + 2, max(i + 2, n - 1)):
+        for j in range(i + 1, n - 1):
             cj = candles_4h[j]
             if cj["l"] <= zone_high and cj["h"] >= zone_low:
                 retests += 1
@@ -387,9 +392,17 @@ def best_active_zone(zones, current_price):
         # SHORT-зону ждём снизу-вверх
         if z["direction"] == "SHORT" and current_price > z["high"] * 1.005:
             continue
-        mid = (z["low"] + z["high"]) / 2
-        dist = abs(current_price - mid) / current_price
-        candidates.append((dist, z))
+        if current_price <= 0:
+            continue
+        # Выбираем ближайшую зону по расстоянию до ближайшей границы (или 0, если внутри).
+        if z["low"] <= current_price <= z["high"]:
+            dist = 0.0
+        elif current_price < z["low"]:
+            dist = z["low"] - current_price
+        else:
+            dist = current_price - z["high"]
+        rel_dist = dist / current_price
+        candidates.append((rel_dist, z))
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0])
@@ -593,7 +606,9 @@ def evaluate_setup(asset_row):
 
 def analyse_asset(coin, fundings):
     candles_4h = fetch_candles(coin, "4h", 200)
-    candles_1h = fetch_candles(coin, "1h", 500)
+    candles_1h_raw = fetch_candles(coin, "1h", 500)
+    # Индикаторы считаем только по закрытым 1H свечам. Текущую цену берём из последней сырой.
+    candles_1h = candles_1h_raw[:-1] if len(candles_1h_raw) >= 2 else []
     if len(candles_4h) < 60 or len(candles_1h) < 60:
         return None
 
@@ -609,7 +624,7 @@ def analyse_asset(coin, fundings):
     atr_1h_series = atr(candles_1h, 14)
     rsi_1h_series = rsi(closes_1h, 14)
 
-    price = closes_1h[-1]
+    price = candles_1h_raw[-1]["c"]
     atr_1h = atr_1h_series[-1] if atr_1h_series else None
 
     regime_4h, dir_4h = classify_regime_4h(candles_4h, atr_4h_series, ema20_4h, ema50_4h)
@@ -640,19 +655,14 @@ def analyse_asset(coin, fundings):
     distance_pct = None
     inside = False
     if best is not None:
-        if best["low"] <= price <= best["high"]:
+        proximity, edge_dist, _near_band = _zone_proximity(price, best, atr_1h)
+        if proximity == "INSIDE":
             status = "inside"
             inside = True
             distance_pct = 0.0
-        else:
-            mid = (best["low"] + best["high"]) / 2
-            distance_pct = abs(price - mid) / price
-            if distance_pct < 0.005:
-                status = "near"
-            elif distance_pct < 0.02:
-                status = "approaching"
-            else:
-                status = "far"
+        elif proximity in ("NEAR", "FAR"):
+            status = "near" if proximity == "NEAR" else "far"
+            distance_pct = (edge_dist / price) if (edge_dist is not None and price and price > 0) else None
 
     funding_risk = False
     if best is not None:
@@ -670,10 +680,12 @@ def analyse_asset(coin, fundings):
         action = "skip — ATR EXTREME"
     elif inside:
         action = f"react — price inside {best['grade']} zone {best['direction']}"
-    elif status == "near":
-        action = f"prep — {best['grade']} {best['direction']} {distance_pct * 100:.2f}% away"
     else:
-        action = f"watch — {best['grade']} {best['direction']} {distance_pct * 100:.2f}% away"
+        dist_str = f"{(distance_pct * 100):.2f}%" if (distance_pct is not None) else "—"
+        if status == "near":
+            action = f"prep — {best['grade']} {best['direction']} {dist_str} away"
+        else:
+            action = f"watch — {best['grade']} {best['direction']} {dist_str} away"
 
     row = {
         "coin": coin,
@@ -841,6 +853,9 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
     while True:
         cycle_start = time.time()
         try:
+            with _state_lock:
+                warmup_done = bool(_state.get("warmup_done", False))
+
             fundings = fetch_funding()
             rows = []
             current_inside_zone_keys = set()
@@ -869,7 +884,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         already_inside = zone_key in _state.get("inside_zone_keys", set())
 
                     # Сигнал только на ВХОДЕ в зону. Пока цена остаётся внутри — не спамим.
-                    if (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
+                    if warmup_done and (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
                         ok = fire_zone_hit(self_webhook_url, r)
                         if ok:
                             log_signal(self_webhook_url, "ZONE_HIT", r)
@@ -911,7 +926,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         already_near = zone_key in _state.get("near_zone_keys", set())
 
                     # Сигнал только на "входе" в near-band + кулдаун
-                    if (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
+                    if warmup_done and (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
                         with _state_lock:
                             _state["last_near_zone_at"][coin] = now
                         price = r.get("price")
@@ -938,6 +953,8 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
             with _state_lock:
                 _state["inside_zone_keys"] = current_inside_zone_keys
                 _state["near_zone_keys"] = current_near_zone_keys
+                if not _state.get("warmup_done", False):
+                    _state["warmup_done"] = True
 
             now = time.time()
             with _state_lock:
