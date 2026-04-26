@@ -41,7 +41,7 @@ SETUP_GRADES = ("A+", "B", "IGNORE")
 SMART_STATUSES = ("ACTION", "READY", "WATCH", "IGNORE")
 
 SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
-REPORT_INTERVAL_SEC = 15 * 60        # тест: сводный отчёт раз в 15 минут
+REPORT_INTERVAL_SEC = 60 * 60
 ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
 NEAR_ZONE_COOLDOWN_SEC = 30 * 60     # кулдаун NEAR_ZONE на актив
 
