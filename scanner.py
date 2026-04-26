@@ -37,6 +37,9 @@ ATR_ABS_THRESHOLDS = {
     "SOL": 0.030,
 }
 
+SETUP_GRADES = ("A+", "B", "IGNORE")
+SMART_STATUSES = ("ACTION", "READY", "WATCH", "IGNORE")
+
 SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
 REPORT_INTERVAL_SEC = 15 * 60        # тест: сводный отчёт раз в 15 минут
 ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
@@ -393,6 +396,175 @@ def best_active_zone(zones, current_price):
     return candidates[0][1]
 
 
+def _zone_key(coin, z):
+    return f"{coin}:{z['direction']}:{round(z['low'], 4)}:{round(z['high'], 4)}"
+
+
+def _zone_proximity(price, zone, atr_1h):
+    """
+    Возвращает (proximity, edge_dist, near_band).
+      proximity: INSIDE | NEAR | FAR
+      edge_dist: расстояние до ближайшей границы (None если INSIDE)
+      near_band: 0.5 * ATR(1H) (None если atr_1h None)
+    """
+    if zone is None or price is None:
+        return "FAR", None, None
+    if zone["low"] <= price <= zone["high"]:
+        return "INSIDE", None, (0.5 * atr_1h) if (atr_1h is not None and atr_1h > 0) else None
+    if price < zone["low"]:
+        edge_dist = zone["low"] - price
+    else:
+        edge_dist = price - zone["high"]
+    near_band = (0.5 * atr_1h) if (atr_1h is not None and atr_1h > 0) else None
+    if near_band is not None and edge_dist <= near_band:
+        return "NEAR", edge_dist, near_band
+    return "FAR", edge_dist, near_band
+
+
+def evaluate_setup(asset_row):
+    """
+    Строгая система оценки для торгового протокола.
+    Обязательные поля в результате:
+      setup_grade: "A+" | "B" | "IGNORE"
+      smart_status: "ACTION" | "READY" | "WATCH" | "IGNORE"
+      reasons: list[str]
+      priority_score: int
+    """
+    reasons = []
+    best = asset_row.get("best_zone")
+    price = asset_row.get("price")
+    a_mode = asset_row.get("atr_mode")
+    trend_aligned = bool(asset_row.get("trend_aligned"))
+    rsi_dir = asset_row.get("rsi_dir")
+    atr_1h = asset_row.get("atr_1h")
+
+    has_zone = best is not None
+    proximity, edge_dist, near_band = _zone_proximity(price, best, atr_1h)
+
+    if not has_zone:
+        reasons.append("no valid zone")
+    if not trend_aligned:
+        reasons.append("4H/1H mismatch")
+    if a_mode == "EXTREME":
+        reasons.append("ATR EXTREME")
+
+    trade_dir = best["direction"] if has_zone else None
+    rsi_ok = False
+    if has_zone:
+        if trade_dir == "LONG":
+            rsi_ok = (rsi_dir == "UP")
+        elif trade_dir == "SHORT":
+            rsi_ok = (rsi_dir == "DOWN")
+    if has_zone and rsi_dir == "FLAT":
+        reasons.append("RSI FLAT")
+    elif has_zone and not rsi_ok:
+        reasons.append("RSI против сделки")
+
+    level_score = int(best.get("score", 0)) if has_zone else 0
+    impulse_strong = bool(has_zone and best.get("impulse_body") is not None and best.get("atr_at_form") and best["impulse_body"] >= 2.0 * best["atr_at_form"])
+    zone_fresh = bool(has_zone and best.get("retests", 999) == 0)
+    zone_trash = bool(has_zone and (best.get("retests", 0) > 2 or level_score < 3))
+
+    if has_zone and zone_trash:
+        reasons.append("zone trash")
+    if has_zone and proximity == "FAR":
+        reasons.append("zone far")
+
+    near_or_inside = proximity in ("INSIDE", "NEAR")
+
+    aplus_conditions = []
+    if has_zone:
+        aplus_conditions.append(("valid zone", True))
+        aplus_conditions.append(("price near/inside zone", near_or_inside))
+        aplus_conditions.append(("4H/1H align OK", trend_aligned))
+        aplus_conditions.append(("ATR != EXTREME", a_mode != "EXTREME"))
+        aplus_conditions.append(("RSI direction matches trade", rsi_ok and rsi_dir != "FLAT"))
+        aplus_conditions.append(("zone fresh / not trash", zone_fresh and not zone_trash))
+        aplus_conditions.append(("impulse strong", impulse_strong))
+        aplus_conditions.append(("level_score >= 3", level_score >= 3))
+
+    allow_b = (
+        has_zone
+        and near_or_inside
+        and trend_aligned
+        and a_mode != "EXTREME"
+        and rsi_ok
+        and rsi_dir != "FLAT"
+        and not zone_trash
+        and level_score >= 3
+    )
+
+    hard_ignore = (
+        (not has_zone)
+        or (not trend_aligned)
+        or (a_mode == "EXTREME")
+        or (has_zone and (rsi_dir == "FLAT" or not rsi_ok))
+        or (has_zone and zone_trash)
+    )
+
+    setup_grade = "IGNORE"
+    if has_zone and near_or_inside and (not hard_ignore):
+        if all(ok for _, ok in aplus_conditions):
+            setup_grade = "A+"
+        elif allow_b:
+            setup_grade = "B"
+
+    smart_status = "IGNORE"
+    if not has_zone:
+        smart_status = "IGNORE"
+    elif proximity == "INSIDE" and setup_grade in ("A+", "B"):
+        smart_status = "ACTION"
+    elif proximity == "NEAR" and setup_grade in ("A+", "B"):
+        smart_status = "READY"
+    elif has_zone and proximity == "FAR":
+        smart_status = "WATCH"
+    else:
+        smart_status = "IGNORE"
+
+    if setup_grade == "A+":
+        reasons = [r for r in reasons if r not in ("zone far",)]
+        if proximity == "NEAR" and edge_dist is not None and price:
+            reasons.append(f"near zone (~{(edge_dist / price) * 100:.2f}%)")
+        if proximity == "INSIDE":
+            reasons.append("price inside zone")
+    elif setup_grade == "B":
+        missing = [name for name, ok in aplus_conditions if not ok]
+        if missing:
+            reasons.append("missing for A+: " + ", ".join(missing[:4]))
+
+    base = 0
+    if setup_grade == "A+":
+        base = 80
+    elif setup_grade == "B":
+        base = 55
+    if smart_status == "ACTION":
+        base += 20
+    elif smart_status == "READY":
+        base += 10
+    base += min(25, level_score * 5)
+    if asset_row.get("funding_risk"):
+        base -= 15
+    if a_mode == "HIGH":
+        base -= 10
+    if a_mode == "EXTREME":
+        base = 0
+    priority_score = int(max(0, min(100, round(base))))
+
+    if setup_grade not in SETUP_GRADES:
+        setup_grade = "IGNORE"
+    if smart_status not in SMART_STATUSES:
+        smart_status = "IGNORE"
+
+    asset_row["setup_grade"] = setup_grade
+    asset_row["smart_status"] = smart_status
+    asset_row["reasons"] = reasons
+    asset_row["priority_score"] = priority_score
+    asset_row["proximity"] = proximity
+    asset_row["edge_dist"] = edge_dist
+    asset_row["near_band"] = near_band
+    return asset_row
+
+
 # ---------------------------------------------------------- Per-asset
 
 def analyse_asset(coin, fundings):
@@ -432,31 +604,6 @@ def analyse_asset(coin, fundings):
     for z in raw_zones:
         grade, score = grade_zone(z, candles_4h, ema20_4h, ema50_4h)
         if grade is None:
-            continue
-
-        # CHAOS на 4H — не ищем сделку.
-        if regime_4h == "CHAOS":
-            continue
-
-        # По протоколу HIGH ATR — только A+. EXTREME ниже блокируется в action и ZONE HIT.
-        if a_mode == "HIGH" and grade != "A+":
-            continue
-
-        # Жёсткий фильтр: тренды должны совпадать
-        if not trend_aligned:
-            continue
-
-        # Направление зоны должно совпадать с направлением выровненного тренда
-        if z["direction"] == "LONG" and dir_4h != "UP":
-            continue
-        if z["direction"] == "SHORT" and dir_4h != "DOWN":
-            continue
-
-        # RSI должен идти строго в сторону сделки: rising для LONG, falling для SHORT.
-        # FLAT не считается подтверждением.
-        if z["direction"] == "LONG" and rsi_dir != "UP":
-            continue
-        if z["direction"] == "SHORT" and rsi_dir != "DOWN":
             continue
 
         z["grade"] = grade
@@ -504,7 +651,7 @@ def analyse_asset(coin, fundings):
     else:
         action = f"watch — {best['grade']} {best['direction']} {distance_pct * 100:.2f}% away"
 
-    return {
+    row = {
         "coin": coin,
         "price": price,
         "regime_4h": regime_4h,
@@ -524,6 +671,7 @@ def analyse_asset(coin, fundings):
         "inside": inside,
         "action": action,
     }
+    return evaluate_setup(row)
 
 
 # ---------------------------------------------------------- Reporting
@@ -544,33 +692,31 @@ def format_report(rows):
     for r in rows:
         if r is None:
             continue
-        align = "OK" if r["trend_aligned"] else "MISMATCH"
-        funding_str = f"{r['funding'] * 100:+.4f}%"
-        if r["funding_risk"]:
-            funding_str += " ⚠️"
-        atr_str = r["atr_mode"]
-        if r["atr_pct_1h"] is not None:
-            atr_str += f" ({r['atr_pct_1h'] * 100:.2f}%)"
-        if r["rsi_1h"] is not None:
-            rsi_str = f"{r['rsi_1h']:.1f} {r['rsi_dir']}"
-        else:
-            rsi_str = "n/a"
+        setup = r.get("setup_grade", "IGNORE")
+        smart = r.get("smart_status", "IGNORE")
+        reasons = r.get("reasons") or []
+
         if r["best_zone"] is not None:
             z = r["best_zone"]
-            zone_str = (
-                f"{z['grade']} {z['direction']} "
-                f"{_fmt_price(z['low'])}–{_fmt_price(z['high'])}"
-            )
+            zone_lines = [
+                f"- {z['direction']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])}",
+                f"- level_score: {int(z.get('score', 0))}  retests: {int(z.get('retests', 0))}",
+            ]
         else:
-            zone_str = "—"
+            zone_lines = ["- —"]
+
+        if reasons:
+            reasons_lines = "\n".join(f"- {x}" for x in reasons[:8])
+        else:
+            reasons_lines = "- —"
 
         lines.append(
             f"\n<b>{r['coin']}</b> @ {_fmt_price(r['price'])}\n"
-            f"  4H: {r['regime_4h']}/{r['dir_4h']}  1H: {r['dir_1h']}  align: {align}\n"
-            f"  ATR(1H): {atr_str}  RSI(1H): {rsi_str}\n"
-            f"  Funding: {funding_str}\n"
-            f"  Zone: {zone_str}\n"
-            f"  Status: {r['status']}  →  {r['action']}"
+            f"Setup: <b>{setup}</b>\n"
+            f"Status: <b>{smart}</b>\n"
+            f"Reasons:\n{reasons_lines}\n"
+            f"Zone:\n" + "\n".join(zone_lines) + "\n"
+            f"Priority:\n- {int(r.get('priority_score', 0))}"
         )
     return "\n".join(lines)
 
@@ -609,10 +755,12 @@ def fire_zone_hit(self_webhook_url, asset_row):
         "price": asset_row["price"],
         "trigger_price": asset_row["price"],
         # Расширения v2 — безопасно для api.py (он их не читает)
-        "grade": z["grade"],
+        "grade": asset_row.get("setup_grade", z.get("grade", "IGNORE")),
         "funding_risk": asset_row["funding_risk"],
         "rsi_dir": asset_row["rsi_dir"],
         "atr_mode": asset_row["atr_mode"],
+        "priority_score": int(asset_row.get("priority_score", 0)),
+        "reasons": asset_row.get("reasons") or [],
     }
     try:
         requests.post(self_webhook_url, json=payload, timeout=8)
@@ -647,12 +795,12 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
 
                 if (
                     r
-                    and r.get("inside")
+                    and r.get("smart_status") == "ACTION"
+                    and r.get("setup_grade") in ("A+", "B")
                     and r.get("best_zone") is not None
-                    and r.get("atr_mode") != "EXTREME"
                 ):
                     z = r["best_zone"]
-                    zone_key = f"{coin}:{z['direction']}:{round(z['low'], 4)}:{round(z['high'], 4)}"
+                    zone_key = _zone_key(coin, z)
                     current_inside_zone_keys.add(zone_key)
 
                     now = time.time()
@@ -668,54 +816,49 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                                 _state["last_zone_hit_at"][coin] = now
                             send_telegram(
                                 telegram_token, chat_id,
-                                (f"🚨 <b>ZONE HIT</b> {coin} "
-                                 f"{r['best_zone']['direction']} "
-                                 f"@ {_fmt_price(r['price'])} "
-                                 f"({r['best_zone']['grade']})"
-                                 + (" ⚠️ funding" if r['funding_risk'] else ""))
+                                (f"<b>ZONE HIT</b>\n"
+                                 f"{coin} @ {_fmt_price(r['price'])}\n"
+                                 f"Setup: <b>{r.get('setup_grade', 'IGNORE')}</b>\n"
+                                 f"Status: <b>{r.get('smart_status', 'IGNORE')}</b>\n"
+                                 f"Priority:\n- {int(r.get('priority_score', 0))}\n"
+                                 f"Zone:\n- {z['direction']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])}")
                             )
 
                 # NEAR_ZONE: цена близко к зоне (<= 0.5 ATR(1H)), но НЕ внутри. Только Telegram, без webhook.
                 if (
                     r
-                    and (not r.get("inside"))
+                    and r.get("smart_status") == "READY"
+                    and r.get("setup_grade") in ("A+", "B")
                     and r.get("best_zone") is not None
-                    and r.get("atr_mode") != "EXTREME"
                 ):
                     z = r["best_zone"]
-                    atr_1h = r.get("atr_1h")
-                    price = r.get("price")
-                    if atr_1h is not None and atr_1h > 0 and price is not None:
-                        if price < z["low"]:
-                            edge_dist = z["low"] - price
-                        elif price > z["high"]:
-                            edge_dist = price - z["high"]
-                        else:
-                            edge_dist = None
+                    zone_key = _zone_key(coin, z)
+                    current_near_zone_keys.add(zone_key)
 
-                        if edge_dist is not None and edge_dist <= 0.5 * atr_1h:
-                            zone_key = f"{coin}:{z['direction']}:{round(z['low'], 4)}:{round(z['high'], 4)}"
-                            current_near_zone_keys.add(zone_key)
+                    now = time.time()
+                    with _state_lock:
+                        last = _state["last_near_zone_at"].get(coin, 0.0)
+                        already_near = zone_key in _state.get("near_zone_keys", set())
 
-                            now = time.time()
-                            with _state_lock:
-                                last = _state["last_near_zone_at"].get(coin, 0.0)
-                                already_near = zone_key in _state.get("near_zone_keys", set())
-
-                            # Сигнал только на "входе" в near-band + кулдаун
-                            if (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
-                                with _state_lock:
-                                    _state["last_near_zone_at"][coin] = now
-                                dist_pct = (edge_dist / price) if price > 0 else 0.0
-                                send_telegram(
-                                    telegram_token, chat_id,
-                                    (f"👀 <b>NEAR ZONE</b> {coin} "
-                                     f"{z['direction']} @ {_fmt_price(price)} "
-                                     f"→ {z['grade']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])} "
-                                     f"dist {_fmt_price(edge_dist)} (~{dist_pct * 100:.2f}%) "
-                                     f"(0.5 ATR≈{_fmt_price(0.5 * atr_1h)})"
-                                     + (" ⚠️ funding" if r.get("funding_risk") else ""))
-                                )
+                    # Сигнал только на "входе" в near-band + кулдаун
+                    if (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
+                        with _state_lock:
+                            _state["last_near_zone_at"][coin] = now
+                        price = r.get("price")
+                        edge_dist = r.get("edge_dist")
+                        near_band = r.get("near_band")
+                        dist_pct = (edge_dist / price) if (edge_dist is not None and price and price > 0) else 0.0
+                        send_telegram(
+                            telegram_token, chat_id,
+                            (f"<b>NEAR ZONE</b>\n"
+                             f"{coin} @ {_fmt_price(price)}\n"
+                             f"Setup: <b>{r.get('setup_grade', 'IGNORE')}</b>\n"
+                             f"Status: <b>{r.get('smart_status', 'IGNORE')}</b>\n"
+                             f"Reasons:\n" + ("\n".join(f"- {x}" for x in (r.get("reasons") or [])[:6]) or "- —") + "\n"
+                             f"Zone:\n- {z['direction']} {_fmt_price(z['low'])}–{_fmt_price(z['high'])}\n"
+                             f"Priority:\n- {int(r.get('priority_score', 0))}\n"
+                             f"Distance:\n- {_fmt_price(edge_dist)} (~{dist_pct * 100:.2f}%)  near_band(0.5 ATR): {_fmt_price(near_band)}")
+                        )
 
             with _state_lock:
                 _state["inside_zone_keys"] = current_inside_zone_keys
