@@ -15,6 +15,7 @@ app = Flask(__name__)
 # нужно будет немедленно отозвать через @BotFather (/revoke).
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+SETUP_KEY = os.getenv("SETUP_KEY", "")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не задан. Добавь его в Railway → Variables.")
@@ -39,7 +40,7 @@ SESSIONS_UTC   = [(8*60, 11*60), (13*60+30, 16*60+30)]
 
 # TODO: временное решение — заменить на Upstash Redis или Railway Volume
 # ✅ переживает рестарт процесса  ❌ не гарантировано при смене инстанса
-STATE_FILE      = "state.json"
+STATE_FILE      = os.getenv("STATE_PATH", "state.json")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 SIGNAL_LOG_MAX = 200
@@ -154,9 +155,9 @@ def _sanitize_signal_payload(data: dict):
     if setup_grade not in ("A+", "B", "IGNORE"):
         setup_grade = "IGNORE"
 
-    smart_status = str(data.get("smart_status", "READY")).upper().strip()
-    if smart_status not in ("READY", "ACTION"):
-        smart_status = "READY"
+    smart_status = str(data.get("smart_status", "IGNORE")).upper().strip()
+    if smart_status not in ("READY", "ACTION", "WATCH", "IGNORE"):
+        smart_status = "IGNORE"
 
     priority_rank = data.get("priority_rank", 0)
     try:
@@ -219,7 +220,15 @@ def get_user(chat_id: str) -> dict:
 def tg_api(method: str, payload: dict):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     try:
-        return requests.post(url, json=payload, timeout=10).json()
+        resp = requests.post(url, json=payload, timeout=10)
+        try:
+            result = resp.json()
+        except Exception as e:
+            print("Telegram API JSON parse error:", e)
+            return None
+        if isinstance(result, dict) and result.get("ok") is False:
+            print("Telegram API returned error:", result)
+        return result
     except Exception as e:
         print("Telegram API error:", e)
         return None
@@ -445,18 +454,20 @@ def ask_reaction_q(chat_id: str, u: dict, q_num: int):
 # ═══════════════════════════════════════════════════════════════════
 def start_journal(chat_id: str, u: dict, outcome: str, pnl_r: float):
     """Начинает flow журнала после закрытия сделки."""
-    at = u.get("active_trade", {}) or {}
-    u["journal_draft"] = {
-        "trade_id": at.get("id", "?"),
-        "outcome":  outcome,
-        "pnl_r":    pnl_r,
-    }
-    u["flow_step"] = "journal_why"
-    save_state()
-    send_message(chat_id,
-        f"📝 Журнал — {at.get('id', '?')}\n\n"
-        f"Почему вошёл? (1–2 предложения)"
-    )
+    with STATE_LOCK:
+        at = u.get("active_trade", {}) or {}
+        u["journal_draft"] = {
+            "trade_id": at.get("id", "?"),
+            "outcome":  outcome,
+            "pnl_r":    pnl_r,
+        }
+        u["flow_step"] = "journal_why"
+        save_state()
+        msg_text = (
+            f"📝 Журнал — {at.get('id', '?')}\n\n"
+            f"Почему вошёл? (1–2 предложения)"
+        )
+    send_message(chat_id, msg_text)
 
 
 def save_trade_to_history(chat_id: str, emotion: int):
@@ -553,56 +564,66 @@ def handle_status(chat_id: str):
 
 
 def handle_sl(chat_id: str):
+    msg = None
+    no_trade_msg = None
     with STATE_LOCK:
         u  = get_user(chat_id)
         at = u.get("active_trade")
         if not at or at.get("closed"):
-            send_message(chat_id, "⚠️ Нет активной открытой сделки.")
-            return
-        rp = at.get("risk_pct", 0.01)
-        u["consecutive_stops"] = u.get("consecutive_stops", 0) + 1
-        u["daily_stops"]       = u.get("daily_stops", 0) + 1
-        u["daily_trades"]      = u.get("daily_trades", 0) + 1
-        u["daily_r"]           = round(u.get("daily_r", 0) - 1.0, 2)
-        u["daily_pnl_pct"]     = round(u.get("daily_pnl_pct", 0) - rp, 4)
-        at["closed"]           = True
-        u["last_alert"]        = None   # сбрасываем контекст алерта
-        cons = u["consecutive_stops"]
-        msg  = (
-            f"🔴 Стоп записан [{at['id']}]\n"
-            f"P&L: {u['daily_pnl_pct']*100:+.2f}% | R: {u['daily_r']:+.1f}R | Стопов подряд: {cons}"
-        )
-        if cons >= 3:
-            msg += "\n\n⛔ 3 стопа подряд — день закрыт."
-        elif cons >= 2:
-            msg += "\n⚠️ Риск 0.5% — только A+."
-        if u["daily_pnl_pct"] <= DAY_LOSS_LIM:
-            msg += "\n\n🚫 Лимит −2% достигнут."
+            no_trade_msg = "⚠️ Нет активной открытой сделки."
+        else:
+            rp = at.get("risk_pct", 0.01)
+            u["consecutive_stops"] = u.get("consecutive_stops", 0) + 1
+            u["daily_stops"]       = u.get("daily_stops", 0) + 1
+            u["daily_trades"]      = u.get("daily_trades", 0) + 1
+            u["daily_r"]           = round(u.get("daily_r", 0) - 1.0, 2)
+            u["daily_pnl_pct"]     = round(u.get("daily_pnl_pct", 0) - rp, 4)
+            at["closed"]           = True
+            u["last_alert"]        = None   # сбрасываем контекст алерта
+            cons = u["consecutive_stops"]
+            msg  = (
+                f"🔴 Стоп записан [{at['id']}]\n"
+                f"P&L: {u['daily_pnl_pct']*100:+.2f}% | R: {u['daily_r']:+.1f}R | Стопов подряд: {cons}"
+            )
+            if cons >= 3:
+                msg += "\n\n⛔ 3 стопа подряд — день закрыт."
+            elif cons >= 2:
+                msg += "\n⚠️ Риск 0.5% — только A+."
+            if u["daily_pnl_pct"] <= DAY_LOSS_LIM:
+                msg += "\n\n🚫 Лимит −2% достигнут."
+    if no_trade_msg is not None:
+        send_message(chat_id, no_trade_msg)
+        return
     send_message(chat_id, msg)
     start_journal(chat_id, u, "loss", -1.0)
 
 
 def handle_win(chat_id: str, r_val: float):
+    msg = None
+    no_trade_msg = None
     with STATE_LOCK:
         u  = get_user(chat_id)
         at = u.get("active_trade")
         if not at or at.get("closed"):
-            send_message(chat_id, "⚠️ Нет активной открытой сделки.")
-            return
-        rp = at.get("risk_pct", 0.01)
-        u["consecutive_stops"] = 0
-        u["daily_trades"]      = u.get("daily_trades", 0) + 1
-        u["daily_r"]           = round(u.get("daily_r", 0) + r_val, 2)
-        u["daily_pnl_pct"]     = round(u.get("daily_pnl_pct", 0) + rp * r_val, 4)
-        at["closed"]           = True
-        u["last_alert"]        = None   # сбрасываем контекст алерта
-        msg = (
-            f"✅ Профит +{r_val}R [{at['id']}]\n"
-            f"R: {u['daily_r']:+.1f}R | P&L: {u['daily_pnl_pct']*100:+.2f}%\n"
-            f"Серия стопов обнулена."
-        )
-        if u["daily_r"] >= DAY_R_LIM:
-            msg += f"\n\n🏁 +{DAY_R_LIM}R — дневная цель. Стоп."
+            no_trade_msg = "⚠️ Нет активной открытой сделки."
+        else:
+            rp = at.get("risk_pct", 0.01)
+            u["consecutive_stops"] = 0
+            u["daily_trades"]      = u.get("daily_trades", 0) + 1
+            u["daily_r"]           = round(u.get("daily_r", 0) + r_val, 2)
+            u["daily_pnl_pct"]     = round(u.get("daily_pnl_pct", 0) + rp * r_val, 4)
+            at["closed"]           = True
+            u["last_alert"]        = None   # сбрасываем контекст алерта
+            msg = (
+                f"✅ Профит +{r_val}R [{at['id']}]\n"
+                f"R: {u['daily_r']:+.1f}R | P&L: {u['daily_pnl_pct']*100:+.2f}%\n"
+                f"Серия стопов обнулена."
+            )
+            if u["daily_r"] >= DAY_R_LIM:
+                msg += f"\n\n🏁 +{DAY_R_LIM}R — дневная цель. Стоп."
+    if no_trade_msg is not None:
+        send_message(chat_id, no_trade_msg)
+        return
     send_message(chat_id, msg)
     start_journal(chat_id, u, "win", r_val)
 
@@ -743,18 +764,22 @@ def webhook():
         )
         return jsonify({"status": "atr extreme"})
 
+    msg_text = None
+    msg_kb   = None
+    resp     = None
+
     with STATE_LOCK:
         u = get_user(CHAT_ID)   # RLock — захватывается повторно, OK
 
         # Активная сделка — новый алерт игнорируем
         at = u.get("active_trade")
         if at and not at.get("closed"):
-            send_message(CHAT_ID,
+            msg_text = (
                 f"⚠️ {asset} {direction} @ {price}\n\n"
                 f"⛔ Новый алерт проигнорирован: уже есть активная сделка [{at['id']}].\n"
                 f"Закрой текущую (/sl или /win) перед новым входом."
             )
-            return jsonify({"status": "active trade exists"})
+            resp = jsonify({"status": "active trade exists"})
 
         # Незавершённый flow — новый алерт перетрёт состояние
         BUSY_STEPS = {
@@ -763,46 +788,53 @@ def webhook():
             "grade", "calc",
             "journal_why", "journal_error_q", "journal_emotion",
         }
-        if u.get("flow_step") in BUSY_STEPS:
-            send_message(CHAT_ID,
+        if not resp and u.get("flow_step") in BUSY_STEPS:
+            msg_text = (
                 f"⚠️ {asset} {direction} @ {price}\n\n"
                 f"⛔ Новый алерт проигнорирован: текущий flow ещё не завершён.\n"
                 f"Шаг: {u['flow_step']}"
             )
-            return jsonify({"status": "flow busy"})
+            resp = jsonify({"status": "flow busy"})
 
         # Дневной блок
-        block = day_blocked(u)
-        if block:
-            send_message(CHAT_ID, f"⚠️ Алерт: {asset} {direction} @ {price}\n\n{block}")
-            return jsonify({"status": "day blocked"})
+        if not resp:
+            block = day_blocked(u)
+            if block:
+                msg_text = f"⚠️ Алерт: {asset} {direction} @ {price}\n\n{block}"
+                resp = jsonify({"status": "day blocked"})
 
         # Кулдаун
-        if not cooldown_ok(u, asset):
+        if not resp and not cooldown_ok(u, asset):
             elapsed = int((time.time() - u["last_alert_ts"].get(asset,0)) / 60)
-            send_message(CHAT_ID,
+            msg_text = (
                 f"⏱ {asset} {direction} @ {price}\n"
                 f"Кулдаун: {elapsed}/{COOLDOWN_MIN} мин. Алерт пропущен."
             )
-            return jsonify({"status": "cooldown"})
+            resp = jsonify({"status": "cooldown"})
 
-        # Сохраняем метаданные
-        u["last_alert_ts"][asset] = time.time()
-        u["last_alert"] = {
-            "asset": asset, "direction": direction,
-            "zone_low": zone_low, "zone_high": zone_high, "price": price,
-            # Подсказки от scanner v2 — нужны для gate / grade
-            "atr_mode":     scanner_atr_mode,
-            "grade":        scanner_grade,
-            "funding_risk": funding_risk,
-            "rsi_dir":      rsi_dir,
-        }
-        u["side"]      = direction
-        u["asset"]     = asset
-        u["reaction"]  = {}
-        u["gate"]      = {}
-        u["flow_step"] = None
-        save_state()
+        if not resp:
+            # Сохраняем метаданные
+            u["last_alert_ts"][asset] = time.time()
+            u["last_alert"] = {
+                "asset": asset, "direction": direction,
+                "zone_low": zone_low, "zone_high": zone_high, "price": price,
+                # Подсказки от scanner v2 — нужны для gate / grade
+                "atr_mode":     scanner_atr_mode,
+                "grade":        scanner_grade,
+                "funding_risk": funding_risk,
+                "rsi_dir":      rsi_dir,
+            }
+            u["side"]      = direction
+            u["asset"]     = asset
+            u["reaction"]  = {}
+            u["gate"]      = {}
+            u["flow_step"] = None
+            save_state()
+
+    if resp:
+        if msg_text:
+            send_message(CHAT_ID, msg_text, reply_markup=msg_kb)
+        return resp
 
     # Доп. строки в карточке (только если сканер их прислал)
     extras = []
@@ -846,304 +878,328 @@ def telegram_webhook():
         cb_id   = cb["id"]
         data    = cb.get("data","")
         chat_id = str(cb.get("message",{}).get("chat",{}).get("id",""))
-        u = get_user(chat_id)   # под STATE_LOCK внутри
         answer_callback(cb_id)
 
-        # ── Начало реакции ─────────────────────────────────────────
-        if data == "reaction_start":
-            block = day_blocked(u)
-            if block:
-                send_message(chat_id, block)
-                return jsonify({"status": "day blocked"})
-            u["reaction"]  = {"q1": None, "q2": None, "q3": None, "score": 0}
-            u["flow_step"] = "reaction_1"
-            save_state()
-            ask_reaction_q(chat_id, u, 1)
+        actions = []
+        resp = {"status": "callback handled"}
 
-        elif data == "reaction_no":
-            u["flow_step"] = None
-            save_state()
-            send_message(chat_id, "❌ Нет реакции — сетап отклонён.")
+        with STATE_LOCK:
+            u = get_user(chat_id)   # RLock — захватывается повторно, OK
 
-        elif data == "invalidate":
-            # Если есть открытая сделка — invalidate не для неё
-            at = u.get("active_trade")
-            if at and not at.get("closed"):
-                send_message(chat_id,
-                    f"⚠️ Есть активная сделка [{at['id']}].\n"
-                    f"Используй /sl, /win или /cleartrade."
-                )
-                return jsonify({"status": "active trade exists"})
-            # Проверяем: есть ли реальный контекст (alert или незакрытый flow)
-            has_alert  = bool(u.get("last_alert"))
-            flow       = u.get("flow_step")
-            in_flow    = flow in ("reaction_1","reaction_2","reaction_3",
-                                  "gate_market","gate_level","gate_atr","gate_news",
-                                  "grade","calc")
-            has_context = has_alert or in_flow
-            u["flow_step"] = None
-            if not has_context:
-                save_state()
-                send_message(chat_id, "⚠️ Нет активного сетапа для аннулирования.")
-            else:
-                u.setdefault("trade_history", []).append({
-                    "id":      f"{u.get('asset','?')}-{u.get('side','?')}-{date.today().strftime('%Y%m%d')}-INV",
-                    "date":    str(date.today()),
-                    "asset":   u.get("asset","?"),
-                    "side":    u.get("side","?"),
-                    "outcome": "invalidated",
-                })
-                u["last_alert"] = None
-                save_state()
-                send_message(chat_id, "🚫 Идея аннулирована. Не стоп — отмена сценария.")
+            # ── Начало реакции ─────────────────────────────────────────
+            if data == "reaction_start":
+                block = day_blocked(u)
+                if block:
+                    actions.append(("send", chat_id, block, None))
+                    resp = {"status": "day blocked"}
+                else:
+                    u["reaction"]  = {"q1": None, "q2": None, "q3": None, "score": 0}
+                    u["flow_step"] = "reaction_1"
+                    save_state()
+                    actions.append(("ask_reaction", chat_id, u, 1))
 
-        # ── Реакция Q1 ─────────────────────────────────────────────
-        elif data in ("r1_yes","r1_no"):
-            u["reaction"]["q1"] = (data == "r1_yes")
-            u["flow_step"]      = "reaction_2"
-            save_state()
-            ask_reaction_q(chat_id, u, 2)
-
-        # ── Реакция Q2 ─────────────────────────────────────────────
-        elif data in ("r2_yes","r2_no"):
-            u["reaction"]["q2"] = (data == "r2_yes")
-            u["flow_step"]      = "reaction_3"
-            save_state()
-            ask_reaction_q(chat_id, u, 3)
-
-        # ── Реакция Q3 — финал scoring ────────────────────────────
-        elif data in ("r3_yes","r3_no"):
-            u["reaction"]["q3"] = (data == "r3_yes")
-            score = sum([
-                bool(u["reaction"].get("q1")),
-                bool(u["reaction"].get("q2")),
-                u["reaction"]["q3"],
-            ])
-            u["reaction"]["score"] = score
-            if score < 2:
+            elif data == "reaction_no":
                 u["flow_step"] = None
                 save_state()
-                send_message(chat_id,
-                    f"🚫 Реакция {score}/3 — сетап отклонён.\n"
-                    f"Минимум 2/3 для продолжения."
-                )
-            else:
-                label = "✅ Сильная" if score == 3 else "⚠️ Допустимая"
-                u["flow_step"] = "gate_market"
-                save_state()
-                send_message(chat_id,
-                    f"{label} реакция {score}/3\n\nРежим рынка:",
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "📈 TREND", "callback_data": "market_TREND"},
-                        {"text": "↔️ RANGE", "callback_data": "market_RANGE"},
-                        {"text": "🌪 CHAOS", "callback_data": "market_CHAOS"},
-                    ]]}
-                )
+                actions.append(("send", chat_id, "❌ Нет реакции — сетап отклонён.", None))
 
-        # ── Gate Q1: режим рынка ────────────────────────────────────
-        elif data.startswith("market_"):
-            market = data.split("_",1)[1]
-            if market == "CHAOS":
-                u["flow_step"] = None
-                save_state()
-                send_message(chat_id, "🚫 CHAOS — сделок нет. Ждёшь структуры.")
-            else:
-                u["gate"]["market"] = market
-                u["flow_step"]      = "gate_level"
-                save_state()
-                send_message(chat_id,
-                    f"Рынок: {market}\n\nКачество уровня:",
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "🎯 4/4 (все критерии)", "callback_data": "level_4"},
-                        {"text": "✅ 3/4",                 "callback_data": "level_3"},
-                    ]]}
-                )
+            elif data == "invalidate":
+                # Если есть открытая сделка — invalidate не для неё
+                at = u.get("active_trade")
+                if at and not at.get("closed"):
+                    actions.append(("send", chat_id,
+                        f"⚠️ Есть активная сделка [{at['id']}].\n"
+                        f"Используй /sl, /win или /cleartrade.",
+                        None
+                    ))
+                    resp = {"status": "active trade exists"}
+                else:
+                    # Проверяем: есть ли реальный контекст (alert или незакрытый flow)
+                    has_alert  = bool(u.get("last_alert"))
+                    flow       = u.get("flow_step")
+                    in_flow    = flow in ("reaction_1","reaction_2","reaction_3",
+                                          "gate_market","gate_level","gate_atr","gate_news",
+                                          "grade","calc")
+                    has_context = has_alert or in_flow
+                    u["flow_step"] = None
+                    if not has_context:
+                        save_state()
+                        actions.append(("send", chat_id, "⚠️ Нет активного сетапа для аннулирования.", None))
+                    else:
+                        u.setdefault("trade_history", []).append({
+                            "id":      f"{u.get('asset','?')}-{u.get('side','?')}-{date.today().strftime('%Y%m%d')}-INV",
+                            "date":    str(date.today()),
+                            "asset":   u.get("asset","?"),
+                            "side":    u.get("side","?"),
+                            "outcome": "invalidated",
+                        })
+                        u["last_alert"] = None
+                        save_state()
+                        actions.append(("send", chat_id, "🚫 Идея аннулирована. Не стоп — отмена сценария.", None))
 
-        # ── Gate Q2: уровень ────────────────────────────────────────
-        elif data in ("level_3","level_4"):
-            level = "4/4" if data == "level_4" else "3/4"
-            u["gate"]["level"] = level
-            # Если scanner v2 уже определил ATR mode — используем без вопроса.
-            scanner_atr = (u.get("last_alert") or {}).get("atr_mode")
-            if scanner_atr in ("NORMAL", "HIGH"):
-                u["gate"]["atr"] = scanner_atr
-                u["flow_step"]   = "gate_news"
+            # ── Реакция Q1 ─────────────────────────────────────────────
+            elif data in ("r1_yes","r1_no"):
+                u["reaction"]["q1"] = (data == "r1_yes")
+                u["flow_step"]      = "reaction_2"
                 save_state()
-                tag = "⚠️" if scanner_atr == "HIGH" else "✅"
-                send_message(chat_id,
-                    f"Уровень: {level}\n"
-                    f"ATR (от сканера): {tag} {scanner_atr}\n\n"
-                    f"Новости в ближайшие 30 мин?",
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "✅ Нет новостей", "callback_data": "news_no"},
-                        {"text": "🚫 Есть новости", "callback_data": "news_yes"},
-                    ]]}
-                )
-            else:
-                u["flow_step"] = "gate_atr"
+                actions.append(("ask_reaction", chat_id, u, 2))
+
+            # ── Реакция Q2 ─────────────────────────────────────────────
+            elif data in ("r2_yes","r2_no"):
+                u["reaction"]["q2"] = (data == "r2_yes")
+                u["flow_step"]      = "reaction_3"
                 save_state()
-                send_message(chat_id,
-                    f"Уровень: {level}\n\nATR сейчас:",
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "✅ NORMAL", "callback_data": "atr_NORMAL"},
-                        {"text": "⚠️ HIGH",   "callback_data": "atr_HIGH"},
-                        {"text": "🚫 EXTREME","callback_data": "atr_EXTREME"},
-                    ]]}
-                )
+                actions.append(("ask_reaction", chat_id, u, 3))
 
-        # ── Gate Q3: ATR ───────────────────────────────────────────
-        elif data.startswith("atr_"):
-            atr = data.split("_",1)[1]
-            if atr == "EXTREME":
-                u["flow_step"] = None
+            # ── Реакция Q3 — финал scoring ────────────────────────────
+            elif data in ("r3_yes","r3_no"):
+                u["reaction"]["q3"] = (data == "r3_yes")
+                score = sum([
+                    bool(u["reaction"].get("q1")),
+                    bool(u["reaction"].get("q2")),
+                    u["reaction"]["q3"],
+                ])
+                u["reaction"]["score"] = score
+                if score < 2:
+                    u["flow_step"] = None
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"🚫 Реакция {score}/3 — сетап отклонён.\n"
+                        f"Минимум 2/3 для продолжения.",
+                        None
+                    ))
+                else:
+                    label = "✅ Сильная" if score == 3 else "⚠️ Допустимая"
+                    u["flow_step"] = "gate_market"
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"{label} реакция {score}/3\n\nРежим рынка:",
+                        {"inline_keyboard": [[
+                            {"text": "📈 TREND", "callback_data": "market_TREND"},
+                            {"text": "↔️ RANGE", "callback_data": "market_RANGE"},
+                            {"text": "🌪 CHAOS", "callback_data": "market_CHAOS"},
+                        ]]}
+                    ))
+
+            # ── Gate Q1: режим рынка ────────────────────────────────────
+            elif data.startswith("market_"):
+                market = data.split("_",1)[1]
+                if market == "CHAOS":
+                    u["flow_step"] = None
+                    save_state()
+                    actions.append(("send", chat_id, "🚫 CHAOS — сделок нет. Ждёшь структуры.", None))
+                else:
+                    u["gate"]["market"] = market
+                    u["flow_step"]      = "gate_level"
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"Рынок: {market}\n\nКачество уровня:",
+                        {"inline_keyboard": [[
+                            {"text": "🎯 4/4 (все критерии)", "callback_data": "level_4"},
+                            {"text": "✅ 3/4",                 "callback_data": "level_3"},
+                        ]]}
+                    ))
+
+            # ── Gate Q2: уровень ────────────────────────────────────────
+            elif data in ("level_3","level_4"):
+                level = "4/4" if data == "level_4" else "3/4"
+                u["gate"]["level"] = level
+                # Если scanner v2 уже определил ATR mode — используем без вопроса.
+                scanner_atr = (u.get("last_alert") or {}).get("atr_mode")
+                if scanner_atr in ("NORMAL", "HIGH"):
+                    u["gate"]["atr"] = scanner_atr
+                    u["flow_step"]   = "gate_news"
+                    save_state()
+                    tag = "⚠️" if scanner_atr == "HIGH" else "✅"
+                    actions.append(("send", chat_id,
+                        f"Уровень: {level}\n"
+                        f"ATR (от сканера): {tag} {scanner_atr}\n\n"
+                        f"Новости в ближайшие 30 мин?",
+                        {"inline_keyboard": [[
+                            {"text": "✅ Нет новостей", "callback_data": "news_no"},
+                            {"text": "🚫 Есть новости", "callback_data": "news_yes"},
+                        ]]}
+                    ))
+                else:
+                    u["flow_step"] = "gate_atr"
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"Уровень: {level}\n\nATR сейчас:",
+                        {"inline_keyboard": [[
+                            {"text": "✅ NORMAL", "callback_data": "atr_NORMAL"},
+                            {"text": "⚠️ HIGH",   "callback_data": "atr_HIGH"},
+                            {"text": "🚫 EXTREME","callback_data": "atr_EXTREME"},
+                        ]]}
+                    ))
+
+            # ── Gate Q3: ATR ───────────────────────────────────────────
+            elif data.startswith("atr_"):
+                atr = data.split("_",1)[1]
+                if atr == "EXTREME":
+                    u["flow_step"] = None
+                    save_state()
+                    actions.append(("send", chat_id, "🚫 ATR EXTREME — не торгуешь.", None))
+                else:
+                    u["gate"]["atr"] = atr
+                    u["flow_step"]   = "gate_news"
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"ATR: {atr}\n\nНовости в ближайшие 30 мин?",
+                        {"inline_keyboard": [[
+                            {"text": "✅ Нет новостей", "callback_data": "news_no"},
+                            {"text": "🚫 Есть новости", "callback_data": "news_yes"},
+                        ]]}
+                    ))
+
+            # ── Gate Q4: новости ────────────────────────────────────────
+            elif data in ("news_yes","news_no"):
+                if data == "news_yes":
+                    u["flow_step"] = None
+                    save_state()
+                    actions.append(("send", chat_id, "🚫 Новости в 30 мин — не торгуешь.", None))
+                else:
+                    u["gate"]["news"] = False
+                    # Проверка сессии
+                    in_session = in_trading_session()
+                    atr        = u["gate"].get("atr","NORMAL")
+                    cons       = u.get("consecutive_stops",0)
+                    # Итог gate — показываем сводку и предлагаем grade
+                    gate_summary = (
+                        f"✅ Pre-trade gate пройден\n\n"
+                        f"Рынок: {u['gate'].get('market','?')} | "
+                        f"Уровень: {u['gate'].get('level','?')} | "
+                        f"ATR: {atr} | "
+                        f"Реакция: {u['reaction'].get('score',0)}/3\n"
+                        f"Сессия: {'✅' if in_session else '⚠️ Вне окна'} ({session_label()})\n\n"
+                        f"Grade:"
+                    )
+                    # B ограничения
+                    b_blocked = (
+                        not in_session or
+                        atr == "HIGH" or
+                        cons >= 2
+                    )
+                    b_label = "🟡 B" if not b_blocked else "🟡 B ⛔"
+                    b_data  = "grade_B" if not b_blocked else "grade_B_blocked"
+                    u["flow_step"] = "grade"
+                    save_state()
+                    actions.append(("send", chat_id, gate_summary,
+                        {"inline_keyboard": [[
+                            {"text": "🟢 A+", "callback_data": "grade_A+"},
+                            {"text": b_label, "callback_data": b_data},
+                        ]]}
+                    ))
+
+            # ── /cleartrade подтверждение ───────────────────────────────
+            elif data == "cleartrade_confirm":
+                at = u.get("active_trade")
+                if at and not at.get("closed"):
+                    trade_id = at.get("id","?")
+                    u["active_trade"] = None
+                    u["flow_step"]    = None
+                    u["last_alert"]   = None
+                    u["last_alert_ts"] = {}   # сбрасываем кулдауны — даём шанс перезайти
+                    u["reaction"]     = {}
+                    u["gate"]         = {}
+                    u["grade"]        = None
+                    u["asset"]        = None
+                    u["side"]         = None
+                    save_state()
+                    actions.append(("send", chat_id,
+                        f"🗑 Сделка [{trade_id}] сброшена без записи в журнал.\n"
+                        f"Убедись что позиция закрыта на бирже.",
+                        None
+                    ))
+                else:
+                    actions.append(("send", chat_id, "Нет активной сделки для сброса.", None))
+            elif data == "cleartrade_cancel":
+                actions.append(("send", chat_id, "Отмена — сделка сохранена.", None))
+
+            # ── /hardreset подтверждение ────────────────────────────────
+            elif data == "hardreset_yes":
+                cons = u.get("consecutive_stops", 0)
+                u["consecutive_stops"] = 0
                 save_state()
-                send_message(chat_id, "🚫 ATR EXTREME — не торгуешь.")
-            else:
-                u["gate"]["atr"] = atr
-                u["flow_step"]   = "gate_news"
+                actions.append(("send", chat_id,
+                    f"✅ Серия стопов {cons} → 0 сброшена.\n"
+                    f"Используй только если серия была записана ошибочно.",
+                    None
+                ))
+            elif data == "hardreset_no":
+                actions.append(("send", chat_id, "Отмена — серия стопов сохранена.", None))
+
+            # ── Grade blocked ───────────────────────────────────────────
+            elif data == "grade_B_blocked":
+                reasons = []
+                if not in_trading_session():
+                    reasons.append("вне торгового окна")
+                if u["gate"].get("atr") == "HIGH":
+                    reasons.append("ATR HIGH")
+                if u.get("consecutive_stops",0) >= 2:
+                    reasons.append(f"{u['consecutive_stops']} стопа подряд")
+                # flow_step остаётся "grade" — пользователь жмёт A+ или /cleartrade.
+                # Но даём ему явный выход: показываем кнопку отмены.
+                actions.append(("send", chat_id,
+                    f"⛔ B заблокирован:\n" + "\n".join(f"• {r}" for r in reasons) +
+                    "\n\nВыбери A+ или отменяй (/cleartrade ничего не запишет — "
+                    "сделки ведь ещё нет; используй /reset чтобы выйти из flow).",
+                    None
+                ))
+
+            # ── Grade выбран ────────────────────────────────────────────
+            elif data in ("grade_A+","grade_B"):
+                grade = "A+" if data == "grade_A+" else "B"
+                reaction_score = u.get("reaction", {}).get("score", 0)
+                # Протокол: A+ требует все 3 условия входа, паттерн = reaction 3/3.
+                if grade == "A+" and reaction_score < 3:
+                    actions.append(("send", chat_id,
+                        f"⚠️ A+ требует реакцию 3/3 — сейчас {reaction_score}/3.\n"
+                        f"Доступен только B.",
+                        None
+                    ))
+                    resp = {"status": "A+ blocked: weak reaction"}
+                elif grade == "B" and u.get("consecutive_stops",0) >= 2:
+                    actions.append(("send", chat_id,
+                        f"⚠️ {u['consecutive_stops']} стопа подряд — только A+.",
+                        None
+                    ))
+                    resp = {"status": "grade blocked"}
+                else:
+                    u["grade"]     = grade
+                    u["flow_step"] = "calc"
+                    save_state()
+                    emoji = "🟢" if grade == "A+" else "🟡"
+                    atr   = u["gate"].get("atr","NORMAL")
+                    atr_note = " | ⚠️ позиция уменьшена (ATR HIGH)" if atr == "HIGH" else ""
+                    # Если scanner v2 прислал funding_risk — напоминаем перед калькулятором
+                    f_risk = (u.get("last_alert") or {}).get("funding_risk")
+                    funding_note = "\n⚠️ Funding против сделки (контекст, не блок)." if f_risk else ""
+                    actions.append(("send", chat_id,
+                        f"{emoji} {u.get('asset','?')} {u.get('side','?')} | Grade {grade}{atr_note}{funding_note}\n\n"
+                        f"Отправь одним сообщением:\n"
+                        f"entry 75620 stop 74980 take 77200",
+                        None
+                    ))
+
+            # ── Journal: ошибка процесса ────────────────────────────────
+            elif data in ("journal_error_yes","journal_error_no"):
+                has_error = (data == "journal_error_yes")
+                jd = u.get("journal_draft") or {}
+                jd["process_error"] = has_error
+                u["journal_draft"]  = jd
+                u["flow_step"]      = "journal_emotion"
                 save_state()
-                send_message(chat_id,
-                    f"ATR: {atr}\n\nНовости в ближайшие 30 мин?",
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "✅ Нет новостей", "callback_data": "news_no"},
-                        {"text": "🚫 Есть новости", "callback_data": "news_yes"},
-                    ]]}
-                )
+                actions.append(("send", chat_id, "Эмоции на входе (1–10):", None))
 
-        # ── Gate Q4: новости ────────────────────────────────────────
-        elif data in ("news_yes","news_no"):
-            if data == "news_yes":
-                u["flow_step"] = None
-                save_state()
-                send_message(chat_id, "🚫 Новости в 30 мин — не торгуешь.")
-            else:
-                u["gate"]["news"] = False
-                # Проверка сессии
-                in_session = in_trading_session()
-                atr        = u["gate"].get("atr","NORMAL")
-                cons       = u.get("consecutive_stops",0)
-                # Итог gate — показываем сводку и предлагаем grade
-                gate_summary = (
-                    f"✅ Pre-trade gate пройден\n\n"
-                    f"Рынок: {u['gate'].get('market','?')} | "
-                    f"Уровень: {u['gate'].get('level','?')} | "
-                    f"ATR: {atr} | "
-                    f"Реакция: {u['reaction'].get('score',0)}/3\n"
-                    f"Сессия: {'✅' if in_session else '⚠️ Вне окна'} ({session_label()})\n\n"
-                    f"Grade:"
-                )
-                # B ограничения
-                b_blocked = (
-                    not in_session or
-                    atr == "HIGH" or
-                    cons >= 2
-                )
-                b_label = "🟡 B" if not b_blocked else "🟡 B ⛔"
-                b_data  = "grade_B" if not b_blocked else "grade_B_blocked"
-                u["flow_step"] = "grade"
-                save_state()
-                send_message(chat_id, gate_summary,
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "🟢 A+", "callback_data": "grade_A+"},
-                        {"text": b_label, "callback_data": b_data},
-                    ]]}
-                )
+        for act in actions:
+            if act[0] == "send":
+                _, cid, t, kb = act
+                send_message(cid, t, reply_markup=kb)
+            elif act[0] == "ask_reaction":
+                _, cid, uref, qn = act
+                ask_reaction_q(cid, uref, qn)
 
-        # ── /cleartrade подтверждение ───────────────────────────────
-        elif data == "cleartrade_confirm":
-            at = u.get("active_trade")
-            if at and not at.get("closed"):
-                trade_id = at.get("id","?")
-                u["active_trade"] = None
-                u["flow_step"]    = None
-                u["last_alert"]   = None
-                u["last_alert_ts"] = {}   # сбрасываем кулдауны — даём шанс перезайти
-                u["reaction"]     = {}
-                u["gate"]         = {}
-                u["grade"]        = None
-                u["asset"]        = None
-                u["side"]         = None
-                save_state()
-                send_message(chat_id,
-                    f"🗑 Сделка [{trade_id}] сброшена без записи в журнал.\n"
-                    f"Убедись что позиция закрыта на бирже."
-                )
-            else:
-                send_message(chat_id, "Нет активной сделки для сброса.")
-        elif data == "cleartrade_cancel":
-            send_message(chat_id, "Отмена — сделка сохранена.")
-
-        # ── /hardreset подтверждение ────────────────────────────────
-        elif data == "hardreset_yes":
-            cons = u.get("consecutive_stops", 0)
-            u["consecutive_stops"] = 0
-            save_state()
-            send_message(chat_id,
-                f"✅ Серия стопов {cons} → 0 сброшена.\n"
-                f"Используй только если серия была записана ошибочно."
-            )
-        elif data == "hardreset_no":
-            send_message(chat_id, "Отмена — серия стопов сохранена.")
-
-        # ── Grade blocked ───────────────────────────────────────────
-        elif data == "grade_B_blocked":
-            reasons = []
-            if not in_trading_session():
-                reasons.append("вне торгового окна")
-            if u["gate"].get("atr") == "HIGH":
-                reasons.append("ATR HIGH")
-            if u.get("consecutive_stops",0) >= 2:
-                reasons.append(f"{u['consecutive_stops']} стопа подряд")
-            # flow_step остаётся "grade" — пользователь жмёт A+ или /cleartrade.
-            # Но даём ему явный выход: показываем кнопку отмены.
-            send_message(chat_id,
-                f"⛔ B заблокирован:\n" + "\n".join(f"• {r}" for r in reasons) +
-                "\n\nВыбери A+ или отменяй (/cleartrade ничего не запишет — "
-                "сделки ведь ещё нет; используй /reset чтобы выйти из flow)."
-            )
-
-        # ── Grade выбран ────────────────────────────────────────────
-        elif data in ("grade_A+","grade_B"):
-            grade = "A+" if data == "grade_A+" else "B"
-            reaction_score = u.get("reaction", {}).get("score", 0)
-            # Протокол: A+ требует все 3 условия входа, паттерн = reaction 3/3.
-            if grade == "A+" and reaction_score < 3:
-                send_message(chat_id,
-                    f"⚠️ A+ требует реакцию 3/3 — сейчас {reaction_score}/3.\n"
-                    f"Доступен только B."
-                )
-                return jsonify({"status": "A+ blocked: weak reaction"})
-            if grade == "B" and u.get("consecutive_stops",0) >= 2:
-                send_message(chat_id,
-                    f"⚠️ {u['consecutive_stops']} стопа подряд — только A+."
-                )
-                return jsonify({"status": "grade blocked"})
-            u["grade"]     = grade
-            u["flow_step"] = "calc"
-            save_state()
-            emoji = "🟢" if grade == "A+" else "🟡"
-            atr   = u["gate"].get("atr","NORMAL")
-            atr_note = " | ⚠️ позиция уменьшена (ATR HIGH)" if atr == "HIGH" else ""
-            # Если scanner v2 прислал funding_risk — напоминаем перед калькулятором
-            f_risk = (u.get("last_alert") or {}).get("funding_risk")
-            funding_note = "\n⚠️ Funding против сделки (контекст, не блок)." if f_risk else ""
-            send_message(chat_id,
-                f"{emoji} {u.get('asset','?')} {u.get('side','?')} | Grade {grade}{atr_note}{funding_note}\n\n"
-                f"Отправь одним сообщением:\n"
-                f"entry 75620 stop 74980 take 77200"
-            )
-
-        # ── Journal: ошибка процесса ────────────────────────────────
-        elif data in ("journal_error_yes","journal_error_no"):
-            has_error = (data == "journal_error_yes")
-            jd = u.get("journal_draft") or {}
-            jd["process_error"] = has_error
-            u["journal_draft"]  = jd
-            u["flow_step"]      = "journal_emotion"
-            save_state()
-            send_message(chat_id, "Эмоции на входе (1–10):")
-
-        return jsonify({"status": "callback handled"})
+        return jsonify(resp)
 
     # ── Обычные сообщения ──────────────────────────────────────────
     if "message" in update:
@@ -1269,21 +1325,26 @@ def telegram_webhook():
                 send_message(chat_id, "Оценка должна быть: good | bad | missed | skip")
                 return jsonify({"status": "bad reviewsignal"})
 
+            msg_text = None
+            resp = {"status": "ok"}
             with STATE_LOCK:
                 log = u.get("signal_log") or []
                 if not log:
-                    send_message(chat_id, "Сигналов пока нет.")
-                    return jsonify({"status": "ok"})
-                max_n = min(10, len(log))
-                if n < 1 or n > max_n:
-                    send_message(chat_id, f"Неверный номер. Доступно: 1..{max_n}")
-                    return jsonify({"status": "bad reviewsignal"})
-                # 1 = самый свежий (последний в списке)
-                log[-n]["review"] = review
-                save_state()
+                    msg_text = "Сигналов пока нет."
+                else:
+                    max_n = min(10, len(log))
+                    if n < 1 or n > max_n:
+                        msg_text = f"Неверный номер. Доступно: 1..{max_n}"
+                        resp = {"status": "bad reviewsignal"}
+                    else:
+                        # 1 = самый свежий (последний в списке)
+                        log[-n]["review"] = review
+                        save_state()
+                        msg_text = f"✅ Review сохранён для сигнала #{n}: {review}"
 
-            send_message(chat_id, f"✅ Review сохранён для сигнала #{n}: {review}")
-            return jsonify({"status": "ok"})
+            if msg_text:
+                send_message(chat_id, msg_text)
+            return jsonify(resp)
 
         if text == "/status":
             handle_status(chat_id)
@@ -1316,39 +1377,43 @@ def telegram_webhook():
             except Exception:
                 send_message(chat_id, "Формат: /balance 14800")
                 return jsonify({"status": "bad balance"})
-            u["account_balance"] = bal
-            save_state()
+            with STATE_LOCK:
+                u["account_balance"] = bal
+                save_state()
             send_message(chat_id, f"✅ Баланс обновлён: ${bal:,.0f}")
             return jsonify({"status": "ok"})
 
         if text == "/pause":
-            u["paused"] = True
-            save_state()
+            with STATE_LOCK:
+                u["paused"] = True
+                save_state()
             send_message(chat_id, "⏸ Пауза. /resume чтобы продолжить.")
             return jsonify({"status": "ok"})
 
         if text == "/resume":
-            u["paused"] = False
-            save_state()
+            with STATE_LOCK:
+                u["paused"] = False
+                save_state()
             send_message(chat_id, "▶️ Пауза снята.")
             return jsonify({"status": "ok"})
 
         if text == "/reset":
-            cons = u.get("consecutive_stops", 0)
-            at   = u.get("active_trade")
-            has_open_trade = at and not at.get("closed")
-            u.update({
-                "day_date":      str(date.today()),
-                "daily_stops":   0,
-                "daily_trades":  0,
-                "daily_r":       0.0,
-                "daily_pnl_pct": 0.0,
-                # consecutive_stops НЕ сбрасывается — только /win или /hardreset
-                # active_trade НЕ сбрасывается — используй /cleartrade
-                "flow_step":     None,
-                "paused":        False,
-            })
-            save_state()
+            with STATE_LOCK:
+                cons = u.get("consecutive_stops", 0)
+                at   = u.get("active_trade")
+                has_open_trade = at and not at.get("closed")
+                u.update({
+                    "day_date":      str(date.today()),
+                    "daily_stops":   0,
+                    "daily_trades":  0,
+                    "daily_r":       0.0,
+                    "daily_pnl_pct": 0.0,
+                    # consecutive_stops НЕ сбрасывается — только /win или /hardreset
+                    # active_trade НЕ сбрасывается — используй /cleartrade
+                    "flow_step":     None,
+                    "paused":        False,
+                })
+                save_state()
             cons_note  = f"\n⚠️ Серия стопов {cons} сохранена." if cons > 0 else ""
             trade_note = (
                 f"\n📌 Активная сделка [{at['id']}] сохранена. /cleartrade — если нужно сбросить."
@@ -1423,18 +1488,17 @@ def telegram_webhook():
             if len(text.strip()) < 3:
                 send_message(chat_id, "Напиши хотя бы несколько слов.")
                 return jsonify({"status": "ok"})
-            jd = u.get("journal_draft") or {}
-            jd["why"]          = text.strip()
-            u["journal_draft"] = jd
-            u["flow_step"]     = "journal_error_q"
-            save_state()
-            send_message(chat_id,
-                "Была ли ошибка процесса?",
-                reply_markup={"inline_keyboard": [[
+            with STATE_LOCK:
+                jd = u.get("journal_draft") or {}
+                jd["why"]          = text.strip()
+                u["journal_draft"] = jd
+                u["flow_step"]     = "journal_error_q"
+                save_state()
+                kb = {"inline_keyboard": [[
                     {"text": "✅ Нет", "callback_data": "journal_error_no"},
                     {"text": "⚠️ Да", "callback_data": "journal_error_yes"},
                 ]]}
-            )
+            send_message(chat_id, "Была ли ошибка процесса?", reply_markup=kb)
             return jsonify({"status": "ok"})
 
         # ── Flow: journal_emotion ──────────────────────────────────
@@ -1450,11 +1514,13 @@ def telegram_webhook():
 
         # ── Flow: calc (entry/stop/take) ───────────────────────────
         if step == "calc":
-            block = day_blocked(u)
+            with STATE_LOCK:
+                block = day_blocked(u)
+                if block:
+                    u["flow_step"] = None
+                    save_state()
             if block:
                 send_message(chat_id, f"Расчёт заблокирован:\n{block}")
-                u["flow_step"] = None
-                save_state()
                 return jsonify({"status": "day blocked"})
             match = re.search(
                 r"entry\s+([0-9]*\.?[0-9]+)\s+stop\s+([0-9]*\.?[0-9]+)\s+take\s+([0-9]*\.?[0-9]+)",
@@ -1479,28 +1545,30 @@ def telegram_webhook():
                 atr_mode          = atr,
             )
             trade_id = ""
-            if result["ok"] and result["allowed"]:
-                trade_id = make_trade_id(u, result["asset"], result["side"])
-                u["active_trade"] = {
-                    "id":           trade_id,
-                    "asset":        result["asset"],
-                    "side":         result["side"],
-                    "grade":        result["grade"],
-                    "entry":        entry,
-                    "stop":         stop,
-                    "take":         take,
-                    "atr_mode":     atr,
-                    "risk_pct":     result["risk_pct"],
-                    "rr":           round(result["rr"],2),
-                    "open_ts":      time.time(),
-                    "session":      "IN" if in_trading_session() else "OUT",
-                    "session_time": session_label(),
-                    "remind_sent":  False,
-                    "closed":       False,
-                }
-            send_message(chat_id, build_calc_message(result, trade_id))
-            u["flow_step"] = None
-            save_state()
+            with STATE_LOCK:
+                if result["ok"] and result["allowed"]:
+                    trade_id = make_trade_id(u, result["asset"], result["side"])
+                    u["active_trade"] = {
+                        "id":           trade_id,
+                        "asset":        result["asset"],
+                        "side":         result["side"],
+                        "grade":        result["grade"],
+                        "entry":        entry,
+                        "stop":         stop,
+                        "take":         take,
+                        "atr_mode":     atr,
+                        "risk_pct":     result["risk_pct"],
+                        "rr":           round(result["rr"],2),
+                        "open_ts":      time.time(),
+                        "session":      "IN" if in_trading_session() else "OUT",
+                        "session_time": session_label(),
+                        "remind_sent":  False,
+                        "closed":       False,
+                    }
+                msg_text = build_calc_message(result, trade_id)
+                u["flow_step"] = None
+                save_state()
+            send_message(chat_id, msg_text)
             return jsonify({"status": "calc sent"})
 
     return jsonify({"status": "ignored"})
@@ -1511,6 +1579,8 @@ def telegram_webhook():
 # ═══════════════════════════════════════════════════════════════════
 @app.route("/setup", methods=["GET"])
 def setup():
+    if SETUP_KEY and request.args.get("key") != SETUP_KEY:
+        return jsonify({"status": "forbidden"}), 403
     base = (PUBLIC_BASE_URL or "https://helptreating-bot-production.up.railway.app").rstrip("/")
     webhook_url = f"{base}/telegram"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
