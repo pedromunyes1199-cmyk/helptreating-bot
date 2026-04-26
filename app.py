@@ -305,9 +305,9 @@ def build_calc_message(r: dict, trade_id: str = "") -> str:
         f"Вход:    {r['entry']}\n"
         f"Стоп:    {r['stop']}  (−{r['stop_pct']:.2f}% / −${r['stop_usd']:.0f})\n"
         f"Тейк:    {r['take']}  (+{r['reward_pct']:.2f}% / +${r['take_usd']:.0f})\n\n"
-        f"Риск:    ${r['risk_usd']:.0f}  ({r['risk_pct']*100:.1f}%)\n"
-        f"Позиция: ${r['pos_usd']:.0f}\n"
+        f"Зайти:   ${r['pos_usd']:.0f}\n"
         f"Плечо:   {r['lev']}x\n"
+        f"Риск:    ${r['risk_usd']:.0f}\n"
         f"RR:      1:{r['rr']:.2f}\n\n"
         f"{status}{rules}{warns}{hint}"
     )
