@@ -42,6 +42,8 @@ SESSIONS_UTC   = [(8*60, 11*60), (13*60+30, 16*60+30)]
 STATE_FILE      = "state.json"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
+SIGNAL_LOG_MAX = 200
+
 # ═══════════════════════════════════════════════════════════════════
 #  ХРАНИЛИЩЕ
 # ═══════════════════════════════════════════════════════════════════
@@ -107,6 +109,99 @@ def ensure_user_state(chat_id: str):
     u.setdefault("grade",             None)
     u.setdefault("journal_draft",     None)
     u.setdefault("trade_history",     [])
+    u.setdefault("signal_log",        [])
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _coerce_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _sanitize_signal_payload(data: dict):
+    """
+    Валидируем и приводим payload для signal_log.
+    Возвращает (clean_dict, None) или (None, error_string).
+    """
+    if not isinstance(data, dict):
+        return None, "bad json"
+
+    typ = str(data.get("type", "")).upper().strip()
+    if typ not in ("NEAR_ZONE", "ZONE_HIT"):
+        return None, "bad type"
+
+    asset = str(data.get("asset", "")).upper().strip()
+    asset = asset.replace("USDT", "").replace("USDC", "")
+    if asset not in SUPPORTED_ASSETS:
+        return None, "bad asset"
+
+    direction = str(data.get("direction", "LONG")).upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        direction = "LONG"
+
+    price = _coerce_float(data.get("price"))
+    zone_low = _coerce_float(data.get("zone_low"))
+    zone_high = _coerce_float(data.get("zone_high"))
+    if price is None or zone_low is None or zone_high is None:
+        return None, "bad price/zone"
+
+    setup_grade = str(data.get("setup_grade", "IGNORE")).upper().strip()
+    if setup_grade not in ("A+", "B", "IGNORE"):
+        setup_grade = "IGNORE"
+
+    smart_status = str(data.get("smart_status", "READY")).upper().strip()
+    if smart_status not in ("READY", "ACTION"):
+        smart_status = "READY"
+
+    priority_rank = data.get("priority_rank", 0)
+    try:
+        priority_rank = int(priority_rank)
+    except Exception:
+        priority_rank = 0
+
+    priority_label = str(data.get("priority_label", "")).strip()
+    atr_mode = str(data.get("atr_mode", "")).upper().strip()
+    rsi_dir = str(data.get("rsi_dir", "")).upper().strip()
+    funding_risk = bool(data.get("funding_risk", False))
+
+    reasons = data.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    reasons = [str(x) for x in reasons if str(x).strip()][:25]
+
+    review = data.get("review", None)
+    if review is not None:
+        review = str(review).lower().strip()
+        if review not in ("good", "bad", "missed", "skip"):
+            review = None
+
+    t = data.get("time")
+    t = str(t).strip() if t else _utc_iso_now()
+
+    clean = {
+        "time": t,
+        "type": typ,
+        "asset": asset,
+        "direction": direction,
+        "price": float(price),
+        "zone_low": float(zone_low),
+        "zone_high": float(zone_high),
+        "setup_grade": setup_grade,
+        "smart_status": smart_status,
+        "priority_rank": priority_rank,
+        "priority_label": priority_label,
+        "atr_mode": atr_mode,
+        "rsi_dir": rsi_dir,
+        "funding_risk": funding_risk,
+        "reasons": reasons,
+        "review": review,
+    }
+    return clean, None
 
 
 def get_user(chat_id: str) -> dict:
@@ -582,6 +677,24 @@ def handle_weekly(chat_id: str):
 # ═══════════════════════════════════════════════════════════════════
 #  A) TRADINGVIEW WEBHOOK
 # ═══════════════════════════════════════════════════════════════════
+@app.route("/log_signal", methods=["POST"])
+def log_signal():
+    data = request.get_json(silent=True) or {}
+    clean, err = _sanitize_signal_payload(data)
+    if err:
+        return jsonify({"status": "bad payload", "error": err}), 400
+
+    with STATE_LOCK:
+        u = get_user(CHAT_ID)  # RLock OK
+        log = u.setdefault("signal_log", [])
+        log.append(clean)
+        if len(log) > SIGNAL_LOG_MAX:
+            u["signal_log"] = log[-SIGNAL_LOG_MAX:]
+        save_state()
+
+    return jsonify({"status": "logged"})
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data      = request.get_json(silent=True) or {}
@@ -1047,6 +1160,9 @@ def telegram_webhook():
                 "/status        — дневной отчёт\n"
                 "/sl            — стоп-лосс\n"
                 "/win 2.3       — профит\n"
+                "/signals       — последние сигналы сканера\n"
+                "/signalstats   — статистика сигналов\n"
+                "/reviewsignal  — оценить сигнал\n"
                 "/weekly        — статистика за 7 дней\n"
                 "/balance 14500 — обновить баланс\n"
                 "/pause         — пауза\n"
@@ -1067,6 +1183,10 @@ def telegram_webhook():
                 "3. Pre-trade gate (рынок / уровень / ATR / новости)\n"
                 "4. Grade A+ / B\n"
                 "5. entry stop take → расчёт\n\n"
+                "Сигналы и оценка:\n"
+                "/signals      — последние 10 сигналов\n"
+                "/signalstats  — статистика сигналов\n"
+                "/reviewsignal N good|bad|missed|skip\n\n"
                 "После сделки:\n"
                 "/sl          — стоп\n"
                 "/win 2.3     — профит\n"
@@ -1075,6 +1195,95 @@ def telegram_webhook():
                 "/balance 14800"
             )
             return jsonify({"status": "help"})
+
+        if text == "/signals":
+            log = (u.get("signal_log") or [])
+            if not log:
+                send_message(chat_id, "Сигналов пока нет.")
+                return jsonify({"status": "ok"})
+            last = log[-10:]
+            last_rev = list(reversed(last))
+            lines = ["📡 Последние сигналы\n"]
+            for i, s in enumerate(last_rev, start=1):
+                asset = s.get("asset", "?")
+                direction = s.get("direction", "?")
+                typ = s.get("type", "?")
+                grade = s.get("setup_grade", "IGNORE")
+                pr_label = s.get("priority_label", "").strip() or f"{asset} {grade}"
+                pr_rank = s.get("priority_rank", 0)
+                price = format_price(s.get("price"))
+                zl = format_price(s.get("zone_low"))
+                zh = format_price(s.get("zone_high"))
+                atr = str(s.get("atr_mode", "UNKNOWN"))
+                rsi = str(s.get("rsi_dir", "FLAT"))
+                fr = "YES" if s.get("funding_risk") else "NO"
+                t = s.get("time", "")
+                lines.append(
+                    f"{i}) {asset} {direction} | {typ} | {grade}\n"
+                    f"Priority #{pr_rank} — {pr_label}\n"
+                    f"Price: {price}\n"
+                    f"Zone: {zl}–{zh}\n"
+                    f"ATR: {atr} | RSI: {rsi} | Funding risk: {fr}\n"
+                    f"Time: {t}"
+                )
+            send_message(chat_id, "\n\n".join(lines))
+            return jsonify({"status": "ok"})
+
+        if text == "/signalstats":
+            log = (u.get("signal_log") or [])
+            total = len(log)
+            near = sum(1 for s in log if s.get("type") == "NEAR_ZONE")
+            hit = sum(1 for s in log if s.get("type") == "ZONE_HIT")
+            aplus = sum(1 for s in log if s.get("setup_grade") == "A+")
+            bcnt = sum(1 for s in log if s.get("setup_grade") == "B")
+            btc = sum(1 for s in log if s.get("asset") == "BTC")
+            eth = sum(1 for s in log if s.get("asset") == "ETH")
+            sol = sum(1 for s in log if s.get("asset") == "SOL")
+            fr = sum(1 for s in log if bool(s.get("funding_risk")))
+            send_message(chat_id,
+                "📊 Signal Stats\n\n"
+                f"Total: {total}\n"
+                f"NEAR_ZONE: {near}\n"
+                f"ZONE_HIT: {hit}\n"
+                f"A+: {aplus}\n"
+                f"B: {bcnt}\n"
+                f"BTC: {btc}\n"
+                f"ETH: {eth}\n"
+                f"SOL: {sol}\n"
+                f"Funding risk: {fr}"
+            )
+            return jsonify({"status": "ok"})
+
+        if text.startswith("/reviewsignal"):
+            parts = text.split()
+            if len(parts) != 3:
+                send_message(chat_id, "Формат: /reviewsignal N good|bad|missed|skip")
+                return jsonify({"status": "bad reviewsignal"})
+            try:
+                n = int(parts[1])
+            except Exception:
+                send_message(chat_id, "N должен быть числом из /signals (1..10).")
+                return jsonify({"status": "bad reviewsignal"})
+            review = parts[2].lower().strip()
+            if review not in ("good", "bad", "missed", "skip"):
+                send_message(chat_id, "Оценка должна быть: good | bad | missed | skip")
+                return jsonify({"status": "bad reviewsignal"})
+
+            with STATE_LOCK:
+                log = u.get("signal_log") or []
+                if not log:
+                    send_message(chat_id, "Сигналов пока нет.")
+                    return jsonify({"status": "ok"})
+                max_n = min(10, len(log))
+                if n < 1 or n > max_n:
+                    send_message(chat_id, f"Неверный номер. Доступно: 1..{max_n}")
+                    return jsonify({"status": "bad reviewsignal"})
+                # 1 = самый свежий (последний в списке)
+                log[-n]["review"] = review
+                save_state()
+
+            send_message(chat_id, f"✅ Review сохранён для сигнала #{n}: {review}")
+            return jsonify({"status": "ok"})
 
         if text == "/status":
             handle_status(chat_id)

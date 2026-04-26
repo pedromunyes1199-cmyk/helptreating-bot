@@ -794,6 +794,42 @@ def fire_zone_hit(self_webhook_url, asset_row):
         return False
 
 
+def log_signal(self_webhook_url, signal_type, asset_row):
+    """
+    Отправляет signal payload в app.py /log_signal.
+    НЕ влияет на логику сигналов и не должен падать при ошибках.
+    """
+    z = asset_row.get("best_zone")
+    if z is None:
+        return False
+    payload = {
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "type": signal_type,
+        "asset": asset_row["coin"],
+        "direction": z["direction"],
+        "price": asset_row["price"],
+        "zone_low": z["low"],
+        "zone_high": z["high"],
+        "setup_grade": asset_row.get("setup_grade", "IGNORE"),
+        "smart_status": asset_row.get("smart_status", "IGNORE"),
+        "priority_rank": int(asset_row.get("priority_rank", 0)),
+        "priority_label": asset_row.get("priority_label", ""),
+        "atr_mode": asset_row.get("atr_mode", ""),
+        "rsi_dir": asset_row.get("rsi_dir", ""),
+        "funding_risk": bool(asset_row.get("funding_risk", False)),
+        "reasons": asset_row.get("reasons") or [],
+        "review": None,
+    }
+    url = self_webhook_url.rsplit("/", 1)[0] + "/log_signal"
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print("[scanner] log signal error:", e)
+        return False
+
+
 # ---------------------------------------------------------- Main loop
 
 def _scanner_loop(telegram_token, chat_id, self_webhook_url):
@@ -836,6 +872,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                     if (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
                         ok = fire_zone_hit(self_webhook_url, r)
                         if ok:
+                            log_signal(self_webhook_url, "ZONE_HIT", r)
                             with _state_lock:
                                 _state["last_zone_hit_at"][coin] = now
                             send_telegram(
@@ -853,6 +890,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                                  f"- A+ только при реакции 3/3\n"
                                  f"- B максимум при реакции 2/3\n"
                                  f"- После реакции отправь: entry ... stop ... take ...\n"
+                                 f"- План сделки бот НЕ открывает автоматически. После реакции отправь entry ... stop ... take ... — бот посчитает размер позиции, плечо, риск и RR.\n"
                                  f"- Бот проверит RR ≥ 2.3")
                             )
 
@@ -880,6 +918,7 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         edge_dist = r.get("edge_dist")
                         near_band = r.get("near_band")
                         dist_pct = (edge_dist / price) if (edge_dist is not None and price and price > 0) else 0.0
+                        log_signal(self_webhook_url, "NEAR_ZONE", r)
                         send_telegram(
                             telegram_token, chat_id,
                             (f"🟡 <b>NEAR ZONE — готовься, НЕ вход</b>\n"
