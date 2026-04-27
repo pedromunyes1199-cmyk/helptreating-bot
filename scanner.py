@@ -815,7 +815,6 @@ def log_signal(self_webhook_url, signal_type, asset_row):
     if z is None:
         return False
     payload = {
-        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "type": signal_type,
         "asset": asset_row["coin"],
         "direction": z["direction"],
@@ -830,12 +829,12 @@ def log_signal(self_webhook_url, signal_type, asset_row):
         "rsi_dir": asset_row.get("rsi_dir", ""),
         "funding_risk": bool(asset_row.get("funding_risk", False)),
         "reasons": asset_row.get("reasons") or [],
-        "review": None,
     }
     url = self_webhook_url.rsplit("/", 1)[0] + "/log_signal"
     try:
         r = requests.post(url, json=payload, timeout=8)
         r.raise_for_status()
+        print("LOG_SIGNAL SENT:", asset_row["coin"], signal_type)
         return True
     except Exception as e:
         print("[scanner] log signal error:", e)
@@ -870,13 +869,14 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
 
                 if (
                     r
-                    and r.get("smart_status") == "ACTION"
-                    and r.get("setup_grade") in ("A+", "B")
                     and r.get("best_zone") is not None
                 ):
                     z = r["best_zone"]
                     zone_key = _zone_key(coin, z)
-                    current_inside_zone_keys.add(zone_key)
+                    price = r.get("price")
+                    inside = bool(price is not None and z["low"] <= price <= z["high"])
+                    if inside:
+                        current_inside_zone_keys.add(zone_key)
 
                     now = time.time()
                     with _state_lock:
@@ -884,10 +884,11 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         already_inside = zone_key in _state.get("inside_zone_keys", set())
 
                     # Сигнал только на ВХОДЕ в зону. Пока цена остаётся внутри — не спамим.
-                    if warmup_done and (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
+                    if inside and warmup_done and (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
+                        log_signal(self_webhook_url, "ZONE_HIT", r)
                         ok = fire_zone_hit(self_webhook_url, r)
                         if ok:
-                            log_signal(self_webhook_url, "ZONE_HIT", r)
+                            print("WEBHOOK SENT:", coin, "ZONE HIT")
                             with _state_lock:
                                 _state["last_zone_hit_at"][coin] = now
                             send_telegram(
