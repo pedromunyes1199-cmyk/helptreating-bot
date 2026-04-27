@@ -45,6 +45,9 @@ REPORT_INTERVAL_SEC = 60 * 60
 ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
 NEAR_ZONE_COOLDOWN_SEC = 30 * 60     # кулдаун NEAR_ZONE на актив
 
+DEBUG_ZONE_LOG = os.getenv("DEBUG_ZONE_LOG", "1") == "1"
+DEBUG_ZONE_COOLDOWN_SEC = 30 * 60
+
 # Funding — контекст, не блок
 FUNDING_LONG_RISK = 0.0003           # > +0.03% — long под вопросом
 FUNDING_SHORT_RISK = -0.0003         # < -0.03% — short под вопросом
@@ -63,6 +66,7 @@ INTERVAL_MS = {
 _state = {
     "last_zone_hit_at": {a: 0.0 for a in ASSETS},
     "last_near_zone_at": {a: 0.0 for a in ASSETS},
+    "last_debug_zone_at": {a: 0.0 for a in ASSETS},
     "last_report_at": 0.0,
     # ключи зон, где цена уже была внутри на прошлом цикле;
     # нужно, чтобы ZONE HIT срабатывал именно на входе в зону, а не каждые 30 минут
@@ -866,6 +870,47 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                     print(f"[scanner] {coin} analyse error: {e}")
                     r = None
                 rows.append(r)
+
+                if (
+                    DEBUG_ZONE_LOG
+                    and r
+                    and r.get("best_zone") is not None
+                ):
+                    z_dbg = r["best_zone"]
+                    px = r.get("price")
+                    atr_h = r.get("atr_1h")
+                    prox_dbg, _, _ = _zone_proximity(px, z_dbg, atr_h)
+                    if prox_dbg in ("INSIDE", "NEAR"):
+                        dbg_now = time.time()
+                        with _state_lock:
+                            last_dbg = _state["last_debug_zone_at"].get(coin, 0.0)
+                        if dbg_now - last_dbg >= DEBUG_ZONE_COOLDOWN_SEC:
+                            reasons_dbg = r.get("reasons") or []
+                            if reasons_dbg:
+                                reasons_txt = "\n".join(f"- {x}" for x in reasons_dbg[:12])
+                            else:
+                                reasons_txt = "- —"
+                            send_telegram(
+                                telegram_token,
+                                chat_id,
+                                (
+                                    f"🧪 <b>DEBUG ZONE — НЕ ВХОД</b>\n"
+                                    f"{coin} {z_dbg['direction']}\n"
+                                    f"Price: {_fmt_price(px)}\n"
+                                    f"Zone: {_fmt_price(z_dbg['low'])}–{_fmt_price(z_dbg['high'])}\n"
+                                    f"proximity: <b>{prox_dbg}</b>\n"
+                                    f"setup_grade: <b>{r.get('setup_grade', 'IGNORE')}</b>\n"
+                                    f"smart_status: <b>{r.get('smart_status', 'IGNORE')}</b>\n"
+                                    f"reasons:\n{reasons_txt}\n"
+                                    f"atr_mode: {r.get('atr_mode', 'UNKNOWN')}\n"
+                                    f"rsi_dir: {r.get('rsi_dir', 'FLAT')}\n"
+                                    f"funding_risk: {'YES ⚠️' if r.get('funding_risk') else 'NO'}\n"
+                                    f"\n<b>Правило</b>: это не торговый сигнал, "
+                                    f"только проверка касаний зоны."
+                                ),
+                            )
+                            with _state_lock:
+                                _state["last_debug_zone_at"][coin] = dbg_now
 
                 if (
                     r
