@@ -51,8 +51,14 @@ SMART_STATUSES = ("ACTION", "READY", "WATCH", "IGNORE")
 
 SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
 REPORT_INTERVAL_SEC = 60 * 60
-ZONE_HIT_COOLDOWN_SEC = 30 * 60      # кулдаун ZONE_HIT на актив
-NEAR_ZONE_COOLDOWN_SEC = 30 * 60     # кулдаун NEAR_ZONE на актив
+# Антиспам Telegram/log_signal: не чаще одного раза на (symbol + zone + proximity) за окно минут (30–60).
+def _proximity_alert_cooldown_sec():
+    try:
+        m = int(os.getenv("PROXIMITY_ALERT_COOLDOWN_MIN", "45"))
+    except ValueError:
+        m = 45
+    m = max(30, min(60, m))
+    return m * 60
 
 DEBUG_ZONE_LOG = os.getenv("DEBUG_ZONE_LOG", "1") == "1"
 DEBUG_ZONE_COOLDOWN_SEC = 30 * 60
@@ -85,8 +91,8 @@ INTERVAL_MS = {
 }
 
 _state = {
-    "last_zone_hit_at": {a: 0.0 for a in ASSETS},
-    "last_near_zone_at": {a: 0.0 for a in ASSETS},
+    # ключ: f"{coin}|{zone_key}|INSIDE" или "|NEAR" -> unix time последнего ZONE_HIT / NEAR_ZONE alert
+    "last_proximity_alert_at": {},
     "last_debug_zone_at": {a: 0.0 for a in ASSETS},
     "last_report_at": 0.0,
     # ключи зон, где цена уже была внутри на прошлом цикле;
@@ -541,6 +547,11 @@ def best_active_zone(zones, current_price):
 
 def _zone_key(coin, z):
     return f"{coin}:{z['direction']}:{round(z['low'], 4)}:{round(z['high'], 4)}"
+
+
+def _proximity_alert_spam_key(coin, zone_key, proximity_kind):
+    """Стабильный ключ для антиспама: символ + зона + NEAR|INSIDE (как в proximity)."""
+    return f"{coin}|{zone_key}|{proximity_kind}"
 
 
 def _zone_proximity(price, zone, atr_1h):
@@ -1284,18 +1295,26 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         current_inside_zone_keys.add(zone_key)
 
                     now = time.time()
+                    cd = _proximity_alert_cooldown_sec()
+                    spam_key_inside = _proximity_alert_spam_key(coin, zone_key, "INSIDE")
                     with _state_lock:
-                        last = _state["last_zone_hit_at"].get(coin, 0.0)
                         already_inside = zone_key in _state.get("inside_zone_keys", set())
+                        last_inside_spam = _state["last_proximity_alert_at"].get(spam_key_inside, 0.0)
 
-                    # Сигнал только на ВХОДЕ в зону. Пока цена остаётся внутри — не спамим.
-                    if inside and warmup_done and (not already_inside) and now - last >= ZONE_HIT_COOLDOWN_SEC:
+                    # Сигнал только на ВХОДЕ в зону (FAR/NEAR -> INSIDE). Пока цена внутри — не спамим.
+                    # Плюс кулдаун на пару (symbol, zone, INSIDE), чтобы не дублировать чаще 30–60 мин.
+                    if (
+                        inside
+                        and warmup_done
+                        and (not already_inside)
+                        and (now - last_inside_spam >= cd)
+                    ):
                         log_signal(self_webhook_url, "ZONE_HIT", r)
+                        with _state_lock:
+                            _state["last_proximity_alert_at"][spam_key_inside] = now
                         ok = fire_zone_hit(self_webhook_url, r)
                         if ok:
                             print("WEBHOOK SENT:", coin, "ZONE HIT")
-                            with _state_lock:
-                                _state["last_zone_hit_at"][coin] = now
                             send_telegram(
                                 telegram_token, chat_id,
                                 (f"🔥 <b>ZONE HIT — смотри реакцию</b>\n"
@@ -1315,29 +1334,31 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                                  f"- Бот проверит RR ≥ 2.3")
                             )
 
-                # NEAR_ZONE: цена близко к зоне (<= 0.5 ATR(1H)), но НЕ внутри. Только Telegram, без webhook.
+                # NEAR_ZONE: proximity NEAR (<= 0.5 ATR до границы), не внутри зоны. Только Telegram, без webhook.
                 if (
                     r
                     and r.get("smart_status") == "READY"
                     and r.get("setup_grade") in ("A+", "B")
                     and r.get("best_zone") is not None
+                    and r.get("proximity") == "NEAR"
                 ):
                     z = r["best_zone"]
                     zone_key = _zone_key(coin, z)
                     current_near_zone_keys.add(zone_key)
 
                     now = time.time()
+                    cd = _proximity_alert_cooldown_sec()
+                    spam_key_near = _proximity_alert_spam_key(coin, zone_key, "NEAR")
                     with _state_lock:
-                        last = _state["last_near_zone_at"].get(coin, 0.0)
                         already_near = zone_key in _state.get("near_zone_keys", set())
+                        last_near_spam = _state["last_proximity_alert_at"].get(spam_key_near, 0.0)
 
-                    # Сигнал только на "входе" в near-band + кулдаун
-                    if warmup_done and (not already_near) and now - last >= NEAR_ZONE_COOLDOWN_SEC:
+                    # Сигнал на первом цикле в NEAR после выхода из «near-состояния» + кулдаун (symbol, zone, NEAR).
+                    if warmup_done and (not already_near) and (now - last_near_spam >= cd):
                         with _state_lock:
-                            _state["last_near_zone_at"][coin] = now
+                            _state["last_proximity_alert_at"][spam_key_near] = now
                         price = r.get("price")
                         edge_dist = r.get("edge_dist")
-                        near_band = r.get("near_band")
                         dist_pct = (edge_dist / price) if (edge_dist is not None and price and price > 0) else 0.0
                         log_signal(self_webhook_url, "NEAR_ZONE", r)
                         send_telegram(
