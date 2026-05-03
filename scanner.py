@@ -8,6 +8,15 @@ Same /webhook payload as v1 (api.py не трогаем). Дополнитель
 (grade, funding_risk, rsi_dir, atr_mode) добавлены безопасно — api.py
 их игнорирует, бот сможет начать использовать на следующей итерации.
 
+После деплоя диагностического логирования (scanner_decisions.jsonl):
+  1) Гонять сканер минимум 7 дней без смены фильтров.
+  2) Собрать статистику: NEAR/INSIDE, сколько раз RSI и 4H/1H блокировали,
+     долю FAR/WATCH.
+  3) Только при подтверждении гипотезы — включать RSI_FILTER_MODE=zone_reaction
+     (не по умолчанию).
+  4) Новый RSI-режим: paper / ручная сверка 10–15 сигналов.
+  5) Не убирать reaction-gate в app.py и не автоматизировать сделки.
+
 Priority 1 changes vs v1:
     1. Бинарный грейд: A+ / B / drop. Никаких A, B+, trash.
     2. ATR(14) считается на 1H. Абсолютные пороги по активу
@@ -48,6 +57,18 @@ NEAR_ZONE_COOLDOWN_SEC = 30 * 60     # кулдаун NEAR_ZONE на актив
 DEBUG_ZONE_LOG = os.getenv("DEBUG_ZONE_LOG", "1") == "1"
 DEBUG_ZONE_COOLDOWN_SEC = 30 * 60
 
+# Конфиг фильтров (дефолты = текущее поведение v2; не меняют логику до явной смены env)
+STRICT_TF_ALIGNMENT = os.getenv("STRICT_TF_ALIGNMENT", "true").lower() in ("1", "true", "yes")
+RSI_FILTER_MODE = os.getenv("RSI_FILTER_MODE", "legacy").strip().lower()
+RSI_FILTER_MODES_ALLOWED = ("legacy", "zone_reaction")
+RSI_LOOKBACK_BARS = 3
+RSI_LOOKBACK_EPS = 1.0
+
+
+def _effective_rsi_filter_mode():
+    m = RSI_FILTER_MODE
+    return m if m in RSI_FILTER_MODES_ALLOWED else "legacy"
+
 # Funding — контекст, не блок
 FUNDING_LONG_RISK = 0.0003           # > +0.03% — long под вопросом
 FUNDING_SHORT_RISK = -0.0003         # < -0.03% — short под вопросом
@@ -78,6 +99,28 @@ _state = {
     "thread": None,
 }
 _state_lock = threading.Lock()
+_decision_log_lock = threading.Lock()
+
+
+def _decision_log_file_path():
+    """Рядом с state.json (STATE_PATH), как scanner_decisions.jsonl."""
+    state_path = os.environ.get("STATE_PATH", "state.json")
+    abs_state = os.path.abspath(state_path)
+    parent = os.path.dirname(abs_state) or os.getcwd()
+    return os.path.join(parent, "scanner_decisions.jsonl")
+
+
+def append_decision_jsonl(record: dict) -> None:
+    """Один объект JSON на строку; не использовать для USER_STATE signal_log."""
+    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    path = _decision_log_file_path()
+    with _decision_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def _print_decision(record: dict) -> None:
+    print("[decision]", json.dumps(record, ensure_ascii=False, default=str))
 
 
 # ---------------------------------------------------------------- HTTP
@@ -275,6 +318,58 @@ def rsi_direction(rsi_series, lookback=3, eps=1.0):
     return "FLAT"
 
 
+ZONE_REACTION_RSI_FAIL = "RSI reaction not confirmed yet"
+
+
+def _legacy_rsi_ok(trade_dir, rsi_dir):
+    """Текущее v2: LONG → UP, SHORT → DOWN."""
+    if trade_dir == "LONG":
+        return rsi_dir == "UP"
+    if trade_dir == "SHORT":
+        return rsi_dir == "DOWN"
+    return False
+
+
+def zone_reaction_rsi_detail(trade_dir, proximity, rsi_dir):
+    """
+    Будущий режим RSI_FILTER_MODE=zone_reaction (тесты + опциональное включение).
+    NEAR: направление к зоне часто против «классического» импульса RSI.
+    INSIDE: ждём подтверждения реакции (LONG не на сыром DOWN и т.д.).
+    FAR: RSI не даёт «готовности» в этом режиме (NEAR/INSIDE отдельно).
+    Возвращает (ok, reason_or_None).
+    """
+    if rsi_dir not in ("UP", "DOWN", "FLAT"):
+        rsi_dir = "FLAT"
+    if proximity == "FAR" or proximity is None:
+        return False, None
+    if trade_dir not in ("LONG", "SHORT"):
+        return False, None
+    if proximity == "NEAR":
+        if trade_dir == "LONG":
+            return (rsi_dir == "DOWN"), None
+        return (rsi_dir == "UP"), None
+    if proximity == "INSIDE":
+        if trade_dir == "LONG":
+            if rsi_dir in ("UP", "FLAT"):
+                return True, None
+            return False, ZONE_REACTION_RSI_FAIL
+        if rsi_dir in ("DOWN", "FLAT"):
+            return True, None
+        return False, ZONE_REACTION_RSI_FAIL
+    return False, None
+
+
+def zone_reaction_rsi_ok(trade_dir, proximity, rsi_dir):
+    ok, _ = zone_reaction_rsi_detail(trade_dir, proximity, rsi_dir)
+    return ok
+
+
+def _rsi_ok_for_mode(trade_dir, proximity, rsi_dir, mode):
+    if mode == "zone_reaction":
+        return zone_reaction_rsi_ok(trade_dir, proximity, rsi_dir)
+    return _legacy_rsi_ok(trade_dir, rsi_dir)
+
+
 # ---------------------------------------------------------- Zone detection
 
 def find_zones(candles_4h, atr_4h):
@@ -384,6 +479,37 @@ def grade_zone(zone, candles_4h, ema20_4h, ema50_4h):
     return None, score
 
 
+def zone_score_breakdown(zone, candles_4h, ema20_4h, ema50_4h):
+    """Те же 4 критерия, что grade_zone — для диагностики и отчётов."""
+    impulse_strong = zone["impulse_body"] >= 2.0 * zone["atr_at_form"]
+    fresh_zero_retests = zone["retests"] == 0
+    i = zone["formed_at_idx"]
+    e20 = ema20_4h[i] if 0 <= i < len(ema20_4h) else None
+    e50 = ema50_4h[i] if 0 <= i < len(ema50_4h) else None
+    ema_confluence = False
+    for e in (e20, e50):
+        if e is not None and zone["low"] <= e <= zone["high"]:
+            ema_confluence = True
+            break
+    lookback = 20
+    lo_idx = max(0, i - lookback)
+    hi_idx = i
+    structural_extreme = False
+    if hi_idx > lo_idx:
+        if zone["direction"] == "LONG":
+            prior_low = min(c["l"] for c in candles_4h[lo_idx:hi_idx])
+            structural_extreme = zone["low"] <= prior_low * 1.001
+        else:
+            prior_high = max(c["h"] for c in candles_4h[lo_idx:hi_idx])
+            structural_extreme = zone["high"] >= prior_high * 0.999
+    return {
+        "impulse_strong": impulse_strong,
+        "fresh_zero_retests": fresh_zero_retests,
+        "ema_confluence": ema_confluence,
+        "structural_extreme": structural_extreme,
+    }
+
+
 def best_active_zone(zones, current_price):
     """Ближайшая валидная зона с правильной стороны от цены."""
     candidates = []
@@ -438,6 +564,186 @@ def _zone_proximity(price, zone, atr_1h):
     return "FAR", edge_dist, near_band
 
 
+def _bars_1h_in_direction(candles_1h, ema20_1h, ema50_1h, dir_1h):
+    """Подряд закрытых 1H баров, где EMA20/EMA50 согласованы с dir_1h."""
+    if dir_1h not in ("UP", "DOWN") or not candles_1h:
+        return 0
+    n = 0
+    for i in range(len(candles_1h) - 1, -1, -1):
+        e20 = ema20_1h[i] if i < len(ema20_1h) else None
+        e50 = ema50_1h[i] if i < len(ema50_1h) else None
+        if e20 is None or e50 is None:
+            break
+        up = e20 > e50
+        if dir_1h == "UP" and up:
+            n += 1
+        elif dir_1h == "DOWN" and not up:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _pullback_context_simple(dir_4h, dir_1h, candles_1h):
+    """Только для логов; не вход."""
+    if len(candles_1h) < 4:
+        return None
+    if dir_4h == "UP" and dir_1h == "DOWN":
+        last = candles_1h[-1]
+        if last["c"] <= last["o"]:
+            return None
+        bear_run = 0
+        for i in range(len(candles_1h) - 2, -1, -1):
+            c = candles_1h[i]
+            if c["c"] < c["o"]:
+                bear_run += 1
+            else:
+                break
+        if bear_run >= 1:
+            return "possible_bullish_pullback_reaction"
+    elif dir_4h == "DOWN" and dir_1h == "UP":
+        last = candles_1h[-1]
+        if last["c"] >= last["o"]:
+            return None
+        bull_run = 0
+        for i in range(len(candles_1h) - 2, -1, -1):
+            c = candles_1h[i]
+            if c["c"] > c["o"]:
+                bull_run += 1
+            else:
+                break
+        if bull_run >= 1:
+            return "possible_bearish_pullback_reaction"
+    return None
+
+
+def _finalize_decision_diagnostics(asset_row):
+    """reject_reasons / decision_state / raw_reason_flags — не для расширения smart_status."""
+    best = asset_row.get("best_zone")
+    has_zone = best is not None
+    prox = asset_row.get("proximity", "FAR")
+    ss = asset_row.get("smart_status", "IGNORE")
+    ta = bool(asset_row.get("trend_aligned"))
+    am = asset_row.get("atr_mode")
+    rsi_dir = asset_row.get("rsi_dir") or "FLAT"
+    diag = asset_row.get("_scanner_diag") or {}
+    rsi_ok = bool(diag.get("rsi_ok"))
+    zone_trash = bool(diag.get("zone_trash"))
+
+    reject = []
+    if not has_zone:
+        reject.append("no valid zone")
+    if has_zone and not ta:
+        reject.append("4H/1H mismatch")
+    if am == "EXTREME":
+        reject.append("ATR EXTREME")
+    if has_zone and rsi_dir == "FLAT":
+        reject.append("RSI FLAT")
+    elif has_zone and not rsi_ok:
+        reject.append("RSI против сделки")
+    if has_zone and zone_trash:
+        reject.append("zone trash")
+
+    flags = {
+        "no_zone": not has_zone,
+        "tf_mismatch": has_zone and not ta,
+        "atr_extreme": am == "EXTREME",
+        "rsi_flat": has_zone and rsi_dir == "FLAT",
+        "rsi_against": has_zone and rsi_dir != "FLAT" and not rsi_ok,
+        "zone_trash": has_zone and zone_trash,
+        "proximity_far": has_zone and prox == "FAR",
+    }
+
+    if not has_zone:
+        dst = "NO_VALID_ZONE"
+    elif not ta:
+        dst = "TF_ALIGNMENT_BLOCK"
+    elif am == "EXTREME":
+        dst = "ATR_EXTREME_BLOCK"
+    elif zone_trash:
+        dst = "ZONE_QUALITY_BLOCK"
+    elif prox == "FAR" and ss == "WATCH":
+        dst = "WATCH_ZONE"
+    elif prox == "FAR":
+        dst = "FAR_FROM_ZONE"
+    elif ss == "ACTION":
+        dst = "ACTION_READY"
+    elif ss == "READY":
+        dst = "SETUP_READY"
+    elif prox == "INSIDE" and ss == "IGNORE":
+        dst = "INSIDE_ZONE_REACTION_PENDING"
+    elif prox == "NEAR" and ss == "IGNORE":
+        if rsi_dir == "FLAT" or not rsi_ok:
+            dst = "RSI_BLOCK"
+        else:
+            dst = "NEAR_ZONE"
+    else:
+        dst = "IGNORE_OTHER"
+
+    asset_row["reject_reasons"] = reject
+    asset_row["raw_reason_flags"] = flags
+    asset_row["decision_state"] = dst
+
+
+def build_decision_record(asset_row):
+    """Одна строка JSONL на актив за цикл."""
+    if asset_row is None:
+        return None
+    z = asset_row.get("best_zone") or {}
+    edge = asset_row.get("edge_dist")
+    price = asset_row.get("price")
+    prox = asset_row.get("proximity")
+    dist_pct = None
+    if prox == "INSIDE":
+        dist_pct = 0.0
+    elif edge is not None and price:
+        try:
+            dist_pct = (float(edge) / float(price)) * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            dist_pct = None
+    ts = datetime.now(timezone.utc).isoformat()
+    diag = asset_row.get("_scanner_diag") or {}
+    return {
+        "timestamp": ts,
+        "symbol": asset_row.get("coin"),
+        "price": price,
+        "trade_dir": z.get("direction"),
+        "zone_low": z.get("low"),
+        "zone_high": z.get("high"),
+        "proximity": prox,
+        "distance_pct": dist_pct,
+        "near_band": asset_row.get("near_band"),
+        "level_score": int(z.get("score", 0)) if z else 0,
+        "setup_grade": asset_row.get("setup_grade"),
+        "score_breakdown": asset_row.get("score_breakdown"),
+        "rsi_value": asset_row.get("rsi_1h"),
+        "rsi_dir": asset_row.get("rsi_dir"),
+        "rsi_lookback": asset_row.get("rsi_lookback"),
+        "rsi_delta": asset_row.get("rsi_delta"),
+        "rsi_ok": diag.get("rsi_ok"),
+        "atr_1h": asset_row.get("atr_1h"),
+        "dir_4h": asset_row.get("dir_4h"),
+        "dir_1h": asset_row.get("dir_1h"),
+        "regime_4h": asset_row.get("regime_4h"),
+        "trend_aligned": asset_row.get("trend_aligned"),
+        "bars_1h_in_direction": asset_row.get("bars_1h_in_direction"),
+        "ema20_1h": asset_row.get("ema20_1h"),
+        "ema50_1h": asset_row.get("ema50_1h"),
+        "ema20_4h": asset_row.get("ema20_4h"),
+        "ema50_4h": asset_row.get("ema50_4h"),
+        "pullback_context": asset_row.get("pullback_context"),
+        "funding": asset_row.get("funding"),
+        "funding_risk": asset_row.get("funding_risk"),
+        "smart_status": asset_row.get("smart_status"),
+        "decision_state": asset_row.get("decision_state"),
+        "reject_reasons": asset_row.get("reject_reasons"),
+        "raw_reason_flags": asset_row.get("raw_reason_flags"),
+        "strict_tf_alignment": STRICT_TF_ALIGNMENT,
+        "rsi_filter_mode": _effective_rsi_filter_mode(),
+        "rsi_filter_mode_raw": RSI_FILTER_MODE,
+    }
+
+
 def evaluate_setup(asset_row):
     """
     Строгая система оценки для торгового протокола.
@@ -468,10 +774,7 @@ def evaluate_setup(asset_row):
     trade_dir = best["direction"] if has_zone else None
     rsi_ok = False
     if has_zone:
-        if trade_dir == "LONG":
-            rsi_ok = (rsi_dir == "UP")
-        elif trade_dir == "SHORT":
-            rsi_ok = (rsi_dir == "DOWN")
+        rsi_ok = _rsi_ok_for_mode(trade_dir, proximity, rsi_dir, _effective_rsi_filter_mode())
     if has_zone and rsi_dir == "FLAT":
         reasons.append("RSI FLAT")
     elif has_zone and not rsi_ok:
@@ -603,6 +906,14 @@ def evaluate_setup(asset_row):
     asset_row["proximity"] = proximity
     asset_row["edge_dist"] = edge_dist
     asset_row["near_band"] = near_band
+    asset_row["_scanner_diag"] = {
+        "rsi_ok": bool(rsi_ok),
+        "zone_trash": bool(zone_trash),
+        "hard_ignore": bool(hard_ignore),
+        "near_or_inside": bool(near_or_inside),
+        "allow_b": bool(allow_b),
+    }
+    _finalize_decision_diagnostics(asset_row)
     return asset_row
 
 
@@ -637,7 +948,7 @@ def analyse_asset(coin, fundings):
 
     a_mode, atr_pct_1h = atr_mode(coin, atr_1h_series, price)
     rsi_val = rsi_1h_series[-1] if rsi_1h_series else None
-    rsi_dir = rsi_direction(rsi_1h_series)
+    rsi_dir = rsi_direction(rsi_1h_series, lookback=RSI_LOOKBACK_BARS, eps=RSI_LOOKBACK_EPS)
 
     funding = fundings.get(coin, 0.0)
 
@@ -691,6 +1002,16 @@ def analyse_asset(coin, fundings):
         else:
             action = f"watch — {best['grade']} {best['direction']} {dist_str} away"
 
+    rsi_delta = None
+    if rsi_1h_series and len(rsi_1h_series) >= RSI_LOOKBACK_BARS + 1:
+        a, b = rsi_1h_series[-1], rsi_1h_series[-1 - RSI_LOOKBACK_BARS]
+        if a is not None and b is not None:
+            rsi_delta = a - b
+
+    score_breakdown = zone_score_breakdown(best, candles_4h, ema20_4h, ema50_4h) if best else None
+    bars_1h_in_direction = _bars_1h_in_direction(candles_1h, ema20_1h, ema50_1h, dir_1h)
+    pullback_context = _pullback_context_simple(dir_4h, dir_1h, candles_1h)
+
     row = {
         "coin": coin,
         "price": price,
@@ -703,6 +1024,8 @@ def analyse_asset(coin, fundings):
         "atr_1h": atr_1h,
         "rsi_1h": rsi_val,
         "rsi_dir": rsi_dir,
+        "rsi_lookback": RSI_LOOKBACK_BARS,
+        "rsi_delta": rsi_delta,
         "funding": funding,
         "funding_risk": funding_risk,
         "best_zone": best,
@@ -710,6 +1033,13 @@ def analyse_asset(coin, fundings):
         "distance_pct": distance_pct,
         "inside": inside,
         "action": action,
+        "score_breakdown": score_breakdown,
+        "ema20_1h": ema20_1h[-1] if ema20_1h else None,
+        "ema50_1h": ema50_1h[-1] if ema50_1h else None,
+        "ema20_4h": ema20_4h[-1] if ema20_4h else None,
+        "ema50_4h": ema50_4h[-1] if ema50_4h else None,
+        "bars_1h_in_direction": bars_1h_in_direction,
+        "pullback_context": pullback_context,
     }
     return evaluate_setup(row)
 
@@ -734,7 +1064,10 @@ def format_report(rows):
             continue
         setup = r.get("setup_grade", "IGNORE")
         smart = r.get("smart_status", "IGNORE")
-        reasons = r.get("reasons") or []
+        reasons = list(r.get("reasons") or [])
+        # WATCH: «зона далеко» не как отказ — только косметика отображения
+        if smart == "WATCH":
+            reasons = [x for x in reasons if x != "zone far"]
 
         if r["best_zone"] is not None:
             z = r["best_zone"]
@@ -745,10 +1078,20 @@ def format_report(rows):
         else:
             zone_lines = ["- —"]
 
-        if reasons:
-            reasons_lines = "\n".join(f"- {x}" for x in reasons[:8])
+        rej = r.get("reject_reasons") or []
+        if smart == "WATCH" and r.get("best_zone") is not None:
+            chunks = ["<i>Состояние: зона есть, цена далеко — ждём подхода</i>"]
+            if rej:
+                chunks.append("\n".join(f"- {x}" for x in rej[:8]))
+            for x in reasons[:8]:
+                if x not in rej:
+                    chunks.append(f"- {x}")
+            reasons_lines = "\n".join(chunks) if chunks else "- —"
         else:
-            reasons_lines = "- —"
+            if reasons:
+                reasons_lines = "\n".join(f"- {x}" for x in reasons[:8])
+            else:
+                reasons_lines = "- —"
 
         lines.append(
             f"\n<b>{r['coin']}</b> @ {_fmt_price(r['price'])}\n"
@@ -870,6 +1213,23 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                     print(f"[scanner] {coin} analyse error: {e}")
                     r = None
                 rows.append(r)
+
+                if r is None:
+                    rec = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": coin,
+                        "price": None,
+                        "smart_status": "IGNORE",
+                        "decision_state": "NO_DATA",
+                        "reject_reasons": ["no data (candles/indicators)"],
+                        "rsi_filter_mode": _effective_rsi_filter_mode(),
+                        "rsi_filter_mode_raw": RSI_FILTER_MODE,
+                        "strict_tf_alignment": STRICT_TF_ALIGNMENT,
+                    }
+                else:
+                    rec = build_decision_record(r)
+                append_decision_jsonl(rec)
+                _print_decision(rec)
 
                 if (
                     DEBUG_ZONE_LOG
