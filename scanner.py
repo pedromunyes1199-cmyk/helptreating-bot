@@ -51,6 +51,8 @@ SMART_STATUSES = ("ACTION", "READY", "WATCH", "IGNORE")
 
 SCAN_INTERVAL_SEC = 5 * 60           # цикл сканера — раз в 5 минут
 REPORT_INTERVAL_SEC = 60 * 60
+# Hourly report в Telegram (Scanner v2 report). Event-based alerts не зависят от этого флага.
+SEND_HOURLY_REPORTS = os.getenv("SEND_HOURLY_REPORTS", "true").lower() in ("1", "true", "yes")
 # Антиспам Telegram/log_signal: не чаще одного раза на (symbol + zone + proximity) за окно минут (30–60).
 def _proximity_alert_cooldown_sec():
     try:
@@ -1388,7 +1390,8 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                 last_report = _state["last_report_at"]
             if now - last_report >= REPORT_INTERVAL_SEC:
                 msg = format_report(rows)
-                send_telegram(telegram_token, chat_id, msg)
+                if SEND_HOURLY_REPORTS:
+                    send_telegram(telegram_token, chat_id, msg)
                 with _state_lock:
                     _state["last_report_at"] = now
 
