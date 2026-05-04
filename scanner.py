@@ -84,6 +84,21 @@ _AUTO_PLAN_ATR_MIN = {
 }
 RR_TARGET = 2.3
 
+# Совпадает с app.py — внутренний cap протокола (не менять торговую логику зон)
+PROTOCOL_MAX_LEV = {"BTC": 4, "ETH": 4, "SOL": 3}
+AUTO_PLAN_STOP_MIN = {"BTC": 0.2, "ETH": 0.2, "SOL": 0.3}
+AUTO_PLAN_STOP_MAX = {"BTC": 2.5, "ETH": 3.0, "SOL": 4.0}
+# Fallback maxLeverage (type=meta), снимок API 2026-05-04: BTC 40, ETH 25, SOL 20
+HL_MAX_LEV_FALLBACK = {"BTC": 40.0, "ETH": 25.0, "SOL": 20.0}
+
+HL_LEVERAGE_CACHE_TTL_SEC = 60 * 60
+_hl_leverage_lock = threading.Lock()
+_hl_leverage_cache = {
+    "ts": 0.0,
+    "per_symbol": {},  # symbol -> {"value": float, "source": str, "error_reason": None | str}
+    "last_refresh_error": None,
+}
+
 
 def _account_balance_usdc():
     raw = os.getenv("ACCOUNT_BALANCE", "").strip()
@@ -756,6 +771,156 @@ def fetch_funding():
     return out
 
 
+def _coerce_max_leverage_value(v):
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if f > 0:
+            return f
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _universe_to_max_leverage_map(meta: dict) -> dict:
+    out = {}
+    for a in meta.get("universe") or []:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name:
+            continue
+        ml = _coerce_max_leverage_value(a.get("maxLeverage"))
+        if ml is not None:
+            out[name] = ml
+    return out
+
+
+def refresh_hyperliquid_max_leverage_cache(force: bool = False) -> None:
+    """
+    Кэш maxLeverage по символу, TTL 1 ч. Сначала metaAndAssetCtxs, при дырах — type=meta.
+    """
+    now = time.time()
+    with _hl_leverage_lock:
+        if (
+            not force
+            and _hl_leverage_cache["per_symbol"]
+            and (now - _hl_leverage_cache["ts"] < HL_LEVERAGE_CACHE_TTL_SEC)
+        ):
+            return
+
+    merged = {}
+    sources = {}
+    last_err = None
+    api_got_any = False
+
+    try:
+        data = _hl_post({"type": "metaAndAssetCtxs"}, timeout=15)
+        if isinstance(data, list) and len(data) >= 1 and isinstance(data[0], dict):
+            um = _universe_to_max_leverage_map(data[0])
+            if um:
+                api_got_any = True
+            for k, v in um.items():
+                merged[k] = v
+                sources[k] = "api_metaAndAssetCtxs"
+        else:
+            last_err = "metaAndAssetCtxs malformed"
+    except Exception as e:
+        last_err = str(e)
+        print(f"[scanner] maxLeverage metaAndAssetCtxs: {e}")
+
+    missing = [s for s in ASSETS if s not in merged]
+    if missing:
+        try:
+            m2 = _hl_post({"type": "meta"}, timeout=15)
+            if isinstance(m2, dict):
+                um2 = _universe_to_max_leverage_map(m2)
+                if um2:
+                    api_got_any = True
+                for s in missing:
+                    if s in um2:
+                        merged[s] = um2[s]
+                        sources[s] = "api_meta"
+        except Exception as e:
+            last_err = last_err or str(e)
+            print(f"[scanner] maxLeverage meta: {e}")
+
+    for sym in ASSETS:
+        if sym in merged and merged.get(sym) is not None:
+            continue
+        merged[sym] = HL_MAX_LEV_FALLBACK.get(sym)
+        sources[sym] = "fallback_due_to_api_error" if not api_got_any else "fallback_missing_symbol"
+
+    per = {}
+    for sym in ASSETS:
+        v = merged.get(sym)
+        if v is None:
+            continue
+        src = sources.get(sym, "fallback_due_to_api_error")
+        err_r = last_err if src == "fallback_due_to_api_error" else None
+        per[sym] = {"value": float(v), "source": src, "error_reason": err_r}
+
+    with _hl_leverage_lock:
+        _hl_leverage_cache["per_symbol"] = per
+        _hl_leverage_cache["ts"] = time.time()
+        _hl_leverage_cache["last_refresh_error"] = last_err
+
+
+def get_hyperliquid_max_leverage(symbol: str) -> dict:
+    """
+    value: max leverage с биржи (после кэша/фолбэка); source — для jsonl.
+    Для неизвестного символа (вне ASSETS) — value None.
+    """
+    refresh_hyperliquid_max_leverage_cache()
+    with _hl_leverage_lock:
+        row = _hl_leverage_cache["per_symbol"].get(symbol)
+    if row:
+        return {
+            "value": row["value"],
+            "source": row["source"],
+            "error_reason": row.get("error_reason"),
+            "max_leverage_source": row["source"],
+        }
+    if symbol in HL_MAX_LEV_FALLBACK:
+        return {
+            "value": HL_MAX_LEV_FALLBACK[symbol],
+            "source": "fallback_static",
+            "error_reason": None,
+            "max_leverage_source": "fallback_static",
+        }
+    return {
+        "value": None,
+        "source": "unknown",
+        "error_reason": "unknown_max_leverage_for_symbol",
+        "max_leverage_source": "unknown",
+    }
+
+
+def _auto_plan_stop_pct(entry_ref, stop_ref) -> float:
+    return abs(float(stop_ref) - float(entry_ref)) / float(entry_ref) * 100.0
+
+
+def _auto_plan_stop_range_warning(symbol: str, entry_ref, stop_ref):
+    pct = _auto_plan_stop_pct(entry_ref, stop_ref)
+    lo = AUTO_PLAN_STOP_MIN.get(symbol, 0.2)
+    hi = AUTO_PLAN_STOP_MAX.get(symbol, 3.0)
+    if pct < lo or pct > hi:
+        return pct, (
+            f"⚠️ Stop outside recommended range {lo}%–{hi}%. "
+            f"Проверь зону/стоп вручную. (stop distance {pct:.2f}%)"
+        )
+    return pct, None
+
+
+def _cap_adjusted_risk_at_max_leverage(account_balance, effective_max_lev, entry_ref, stop_ref):
+    """Как в ТЗ: max notional at cap → implied risk USDC."""
+    max_pos = float(account_balance) * float(effective_max_lev)
+    capped_risk = max_pos * abs(float(entry_ref) - float(stop_ref)) / float(entry_ref)
+    capped_pct = capped_risk / float(account_balance) * 100.0
+    return max_pos, capped_risk, capped_pct
+
+
 # ---------------------------------------------------------- Indicators
 
 def ema(values, period):
@@ -862,12 +1027,67 @@ def _emit_auto_plan_if_eligible(w, cur, wk, telegram_token, chat_id):
         w["sent_auto_plan"] = True
         return True
 
+    hl_info = get_hyperliquid_max_leverage(sym)
+    hl_max = hl_info.get("value")
+    if hl_max is None:
+        ml_src = hl_info.get("max_leverage_source", "unknown")
+        rec_u = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym,
+            "direction": w["trade_dir"],
+            "setup_grade": sg,
+            "reaction_score": 3,
+            "status": "AUTO_PLAN_ERROR_UNKNOWN_LEVERAGE",
+            "max_leverage_source": ml_src,
+            "max_leverage_error_reason": hl_info.get("error_reason") or "unknown_max_leverage_for_symbol",
+            "observation_only": True,
+            "watch_key": wk,
+        }
+        append_auto_plan_jsonl(rec_u)
+        _print_auto_plan(rec_u)
+        send_telegram(
+            telegram_token,
+            chat_id,
+            f"⚠️ Не могу определить max leverage для <b>{sym}</b> — добавь fallback или проверь API.\n"
+            f"<i>AUTO_PLAN_ERROR_UNKNOWN_LEVERAGE</i>",
+        )
+        w["sent_auto_plan"] = True
+        return True
+
+    prot = float(PROTOCOL_MAX_LEV.get(sym, 3))
+    eff = min(float(hl_max), prot)
+    stop_pct = _auto_plan_stop_pct(full["entry_ref"], full["stop_ref"])
+    _, stop_warn = _auto_plan_stop_range_warning(sym, full["entry_ref"], full["stop_ref"])
+
     risk_u = full.get("risk_usdc")
     pos_u = full.get("position_size_usdc")
     lev = full.get("estimated_leverage")
     bal_u = full.get("account_balance_used")
 
-    rec_ok = {
+    ml_rec_src = hl_info.get("max_leverage_source", "")
+    with _hl_leverage_lock:
+        refresh_err = _hl_leverage_cache.get("last_refresh_error")
+    ml_err = hl_info.get("error_reason") or (
+        refresh_err if ml_rec_src == "fallback_due_to_api_error" else None
+    )
+
+    lev_block = (
+        f"<b>Hyperliquid max</b>: {hl_max:.0f}x\n"
+        f"<b>Protocol cap</b>: {prot:.0f}x\n"
+        f"<b>Effective cap</b>: {eff:.2f}x\n"
+    )
+    if lev is not None:
+        lev_block += f"<b>Required / estimated leverage</b>: {lev:.2f}x\n"
+        lev_ok = lev <= eff + 1e-12
+        lev_block += f"<b>Leverage check</b>: {'OK' if lev_ok else 'WARNING'}\n"
+    else:
+        lev_block += "<b>Required / estimated leverage</b>: —\n"
+        lev_block += "<b>Leverage check</b>: — (задай ACCOUNT_BALANCE для оценки)\n"
+        lev_ok = True
+
+    stop_block = f"\n{stop_warn}\n" if stop_warn else ""
+
+    base_json = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbol": sym,
         "direction": w["trade_dir"],
@@ -880,13 +1100,70 @@ def _emit_auto_plan_if_eligible(w, cur, wk, telegram_token, chat_id):
         "position_size_usdc": pos_u,
         "estimated_leverage": lev,
         "account_balance_used": bal_u,
-        "status": "AUTO_PLAN_READY_NOT_EXECUTED",
         "rr_target": RR_TARGET,
         "buffer": full.get("buffer"),
         "risk_per_unit": full.get("risk_per_unit"),
         "watch_key": wk,
         "observation_only": True,
+        "stop_distance_pct": stop_pct,
+        "hyperliquid_max_leverage": hl_max,
+        "protocol_max_leverage": prot,
+        "effective_max_leverage": eff,
+        "max_leverage_source": ml_rec_src,
+        "max_leverage_error_reason": ml_err,
+        "leverage_check_ok": bool(lev_ok) if lev is not None else None,
     }
+
+    disclaimer = (
+        "\n\n⚠️ Это <b>НЕ</b> авто-вход. Бот не открыл сделку. "
+        "Проверь график и открой руками, если согласен."
+    )
+
+    # Превышение effective cap при известном sizing
+    if lev is not None and bal_u is not None and lev > eff:
+        max_pos, cap_risk, cap_pct = _cap_adjusted_risk_at_max_leverage(
+            bal_u, eff, full["entry_ref"], full["stop_ref"]
+        )
+        rec_w = dict(base_json)
+        rec_w.update(
+            {
+                "status": "AUTO_PLAN_WARNING_LEVERAGE_LIMIT",
+                "leverage_check_ok": False,
+                "capped_position_size_usdc": max_pos,
+                "capped_risk_usdc": cap_risk,
+                "capped_risk_pct": cap_pct,
+            }
+        )
+        append_auto_plan_jsonl(rec_w)
+        _print_auto_plan(rec_w)
+        text_w = (
+            f"✅ <b>AUTO REACTION CONFIRMED — PLAN READY</b>\n"
+            f"{sym} {w['trade_dir']}\n"
+            f"Setup: <b>{sg}</b> | Reaction score: <b>3/3</b>\n"
+            f"{criteria_txt}\n\n"
+            f"{lev_block}\n"
+            f"⚠️ <b>Required leverage exceeds effective cap.</b>\n"
+            f"<b>Required</b>: {lev:.2f}x\n"
+            f"<b>Effective cap</b>: {eff:.2f}x\n\n"
+            f"<b>Original plan</b>:\n"
+            f"Position size: {_fmt_price(pos_u)} USDC\n"
+            f"Risk: {_fmt_price(risk_u)} USDC\n\n"
+            f"<b>Cap-adjusted plan</b>:\n"
+            f"Max position at cap: {_fmt_price(max_pos)} USDC\n"
+            f"Actual risk at cap: {_fmt_price(cap_risk)} USDC ({cap_pct:.2f}%)\n"
+            f"RR min TP remains {RR_TARGET} by construction.\n"
+            f"{stop_block}"
+            f"{disclaimer}"
+        )
+        send_telegram(telegram_token, chat_id, text_w)
+        w["sent_auto_plan"] = True
+        return True
+
+    rec_ok = dict(base_json)
+    rec_ok["status"] = "AUTO_PLAN_READY_NOT_EXECUTED"
+    rec_ok["capped_position_size_usdc"] = None
+    rec_ok["capped_risk_usdc"] = None
+    rec_ok["capped_risk_pct"] = None
     append_auto_plan_jsonl(rec_ok)
     _print_auto_plan(rec_ok)
 
@@ -908,13 +1185,15 @@ def _emit_auto_plan_if_eligible(w, cur, wk, telegram_token, chat_id):
         f"{sym} {w['trade_dir']}\n"
         f"Setup: <b>{sg}</b> | Reaction score: <b>3/3</b>\n"
         f"{criteria_txt}\n\n"
+        f"{lev_block}"
         f"<b>entry_ref</b>: {_fmt_price(full['entry_ref'])}\n"
         f"<b>stop_ref</b>: {_fmt_price(full['stop_ref'])}\n"
         f"<b>min_tp (RR≥{RR_TARGET})</b>: {_fmt_price(full['min_tp_for_RR_2_3'])}\n"
         f"<b>RR</b>: {RR_TARGET} (по min_tp)\n"
-        f"{sz_note}\n\n"
-        f"⚠️ Ордер <b>НЕ</b> открыт. Открывай руками, если согласен.\n"
-        f"Это <b>НЕ</b> авто-вход. Бот не открыл сделку. Проверь график и открой руками, если согласен."
+        f"{sz_note}"
+        f"{stop_block}\n"
+        f"⚠️ Ордер <b>НЕ</b> открыт. Открывай руками, если согласен."
+        f"{disclaimer}"
     )
     send_telegram(telegram_token, chat_id, text_ok)
     w["sent_auto_plan"] = True
