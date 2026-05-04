@@ -65,6 +65,13 @@ def _proximity_alert_cooldown_sec():
 DEBUG_ZONE_LOG = os.getenv("DEBUG_ZONE_LOG", "1") == "1"
 DEBUG_ZONE_COOLDOWN_SEC = 30 * 60
 
+# Автооценка реакции на 15m после ZONE_HIT — только наблюдение, не сигнал и не вход.
+OBSERVATION_MODE = os.getenv("OBSERVATION_MODE", "false").lower() in ("1", "true", "yes")
+
+_active_reaction_watches: dict = {}
+_reaction_watch_lock = threading.Lock()
+_reaction_log_lock = threading.Lock()
+
 # Конфиг фильтров (дефолты = текущее поведение v2; не меняют логику до явной смены env)
 STRICT_TF_ALIGNMENT = os.getenv("STRICT_TF_ALIGNMENT", "true").lower() in ("1", "true", "yes")
 RSI_FILTER_MODE = os.getenv("RSI_FILTER_MODE", "legacy").strip().lower()
@@ -131,6 +138,25 @@ def _print_decision(record: dict) -> None:
     print("[decision]", json.dumps(record, ensure_ascii=False, default=str))
 
 
+def _reaction_log_file_path():
+    state_path = os.environ.get("STATE_PATH", "state.json")
+    abs_state = os.path.abspath(state_path)
+    parent = os.path.dirname(abs_state) or os.getcwd()
+    return os.path.join(parent, "reaction_decisions.jsonl")
+
+
+def append_reaction_jsonl(record: dict) -> None:
+    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    path = _reaction_log_file_path()
+    with _reaction_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def _print_reaction(record: dict) -> None:
+    print("[reaction]", json.dumps(record, ensure_ascii=False, default=str))
+
+
 # ---------------------------------------------------------------- HTTP
 
 def _hl_post(payload, timeout=15):
@@ -169,6 +195,378 @@ def fetch_candles(coin, interval, lookback_bars):
             continue
     out.sort(key=lambda x: x["t"])
     return out
+
+
+# ---------------------------------------------------------- Reaction observation (15m, OBSERVATION_MODE only)
+
+REACTION_WINDOW_BARS = 4
+
+
+def _candle_end_ms(c, interval="15m"):
+    return int(c["t"]) + INTERVAL_MS[interval]
+
+
+def _last_closed_candles_before(hit_ts_ms, candles, interval="15m"):
+    """Свечи, у которых полное закрытие <= hit_ts_ms."""
+    iv = INTERVAL_MS[interval]
+    closed = [c for c in candles if _candle_end_ms(c, interval) <= hit_ts_ms]
+    closed.sort(key=lambda x: x["t"])
+    return closed
+
+
+def _last_n_closed_before_hit(hit_ts_ms, candles, n=5, interval="15m"):
+    closed = _last_closed_candles_before(hit_ts_ms, candles, interval)
+    return closed[-n:] if len(closed) >= n else closed
+
+
+def _first_four_closed_after_hit(hit_ts_ms, candles, now_ms, interval="15m"):
+    """Первые четыре полностью закрытые свечи после hit (close > hit, close <= now)."""
+    iv = INTERVAL_MS[interval]
+    out = []
+    for c in sorted(candles, key=lambda x: x["t"]):
+        end = _candle_end_ms(c, interval)
+        if end <= hit_ts_ms:
+            continue
+        if end > now_ms:
+            continue
+        out.append(c)
+        if len(out) >= REACTION_WINDOW_BARS:
+            break
+    return out
+
+
+def short_rejection_candle(c, zone_low):
+    return c["h"] >= zone_low and c["c"] < zone_low
+
+
+def long_rejection_candle(c, zone_high):
+    return c["l"] <= zone_high and c["c"] > zone_high
+
+
+def bearish_engulfing(prev, cur):
+    if prev is None:
+        return False
+    po, pc = prev["o"], prev["c"]
+    co, cc = cur["o"], cur["c"]
+    if not (pc > po):
+        return False
+    if not (cc < co):
+        return False
+    if not (co >= pc):
+        return False
+    if not (cc <= po):
+        return False
+    return True
+
+
+def bullish_engulfing(prev, cur):
+    if prev is None:
+        return False
+    po, pc = prev["o"], prev["c"]
+    co, cc = cur["o"], cur["c"]
+    if not (pc < po):
+        return False
+    if not (cc > co):
+        return False
+    if not (co <= pc):
+        return False
+    if not (cc >= po):
+        return False
+    return True
+
+
+def bearish_pin_bar(c):
+    o, h, l, cl = c["o"], c["h"], c["l"], c["c"]
+    if cl >= o:
+        return False
+    body = o - cl
+    if body <= 0:
+        return False
+    upper_wick = h - o
+    rng = h - l
+    if rng <= 0:
+        return False
+    if upper_wick < 2 * body:
+        return False
+    third_boundary = l + rng / 3.0
+    if o > third_boundary:
+        return False
+    return True
+
+
+def bullish_pin_bar(c):
+    o, h, l, cl = c["o"], c["h"], c["l"], c["c"]
+    if cl <= o:
+        return False
+    body = cl - o
+    if body <= 0:
+        return False
+    lower_wick = o - l
+    rng = h - l
+    if rng <= 0:
+        return False
+    if lower_wick < 2 * body:
+        return False
+    third_boundary = h - rng / 3.0
+    if o < third_boundary:
+        return False
+    return True
+
+
+def _short_trigger_pattern(prev, cur):
+    if bearish_engulfing(prev, cur):
+        return "bearish engulfing"
+    if bearish_pin_bar(cur):
+        return "bearish pin bar"
+    return None
+
+
+def _long_trigger_pattern(prev, cur):
+    if bullish_engulfing(prev, cur):
+        return "bullish engulfing"
+    if bullish_pin_bar(cur):
+        return "bullish pin bar"
+    return None
+
+
+def _apply_reaction_candle(w, prev, cur):
+    """
+    Обновляет criteria_hit / touch_seen / score. prev — предыдущая закрытая 15M (может быть до окна).
+    Возвращает список названий паттернов триггера с этой свечи (для лога).
+    """
+    td = w["trade_dir"]
+    zl, zh = w["zone_low"], w["zone_high"]
+    patterns = []
+    ch = w["criteria_hit"]
+
+    if td == "SHORT":
+        if short_rejection_candle(cur, zl):
+            ch["rejection"] = True
+        tp = _short_trigger_pattern(prev, cur)
+        if tp:
+            ch["trigger"] = True
+            patterns.append(tp)
+            w.setdefault("trigger_detail", tp)
+        if cur["h"] >= zl:
+            w["touch_seen"] = True
+        if w["touch_seen"] and cur["c"] < w["pre_hit_local_low_5"]:
+            ch["structure_break"] = True
+    elif td == "LONG":
+        if long_rejection_candle(cur, zh):
+            ch["rejection"] = True
+        tp = _long_trigger_pattern(prev, cur)
+        if tp:
+            ch["trigger"] = True
+            patterns.append(tp)
+            w.setdefault("trigger_detail", tp)
+        if cur["l"] <= zh:
+            w["touch_seen"] = True
+        if w["touch_seen"] and cur["c"] > w["pre_hit_local_high_5"]:
+            ch["structure_break"] = True
+
+    w["score"] = sum(1 for v in ch.values() if v)
+    return patterns
+
+
+def _reaction_status_lines(w):
+    ch = w["criteria_hit"]
+    default_td = (
+        "bullish engulfing / pin bar" if w["trade_dir"] == "LONG" else "bearish engulfing / pin bar"
+    )
+    td = w.get("trigger_detail") or default_td
+    lines = [f"{'✓' if ch['rejection'] else '✗'} rejection"]
+    if ch["trigger"]:
+        lines.append(f"✓ trigger candle: {td}")
+    else:
+        lines.append("✗ trigger candle")
+    lines.append(f"{'✓' if ch['structure_break'] else '✗'} structure break")
+    return lines
+
+
+def _build_reaction_log_record(
+    w, watch_key, candle_end_ms, window_label, status, pattern_detected, structure_level, cur,
+):
+    ts = datetime.now(timezone.utc).isoformat()
+    return {
+        "timestamp": ts,
+        "symbol": w["symbol"],
+        "trade_dir": w["trade_dir"],
+        "zone_low": w["zone_low"],
+        "zone_high": w["zone_high"],
+        "zone_hit_price": w.get("zone_hit_price"),
+        "candle_time": candle_end_ms,
+        "reaction_window": window_label,
+        "criteria_hit": dict(w["criteria_hit"]),
+        "score": w["score"],
+        "status": status,
+        "pattern_detected": pattern_detected,
+        "structure_level": structure_level,
+        "close": cur["c"],
+        "high": cur["h"],
+        "low": cur["l"],
+        "watch_key": watch_key,
+        "observation_only": True,
+    }
+
+
+def _send_reaction_telegram_confirmed(telegram_token, chat_id, w):
+    sym = w["symbol"]
+    td = w["trade_dir"]
+    sc = w["score"]
+    lines = _reaction_status_lines(w)
+    text = (
+        f"🧪 <b>AUTO REACTION CHECK — OBSERVATION ONLY</b>\n"
+        f"{sym} {td}\n"
+        f"Reaction score: {sc}/3\n"
+        + "\n".join(lines)
+        + "\n\nManual reaction-gate remains primary.\n"
+        f"<b>НЕ вход.</b> Сравни с графиком."
+    )
+    send_telegram(telegram_token, chat_id, text)
+
+
+def _send_reaction_telegram_failed(telegram_token, chat_id, w, reason_lines):
+    sym = w["symbol"]
+    td = w["trade_dir"]
+    sc = w["score"]
+    extra = "\n".join(reason_lines) if reason_lines else "—"
+    text = (
+        f"🧪 <b>AUTO REACTION FAILED — OBSERVATION ONLY</b>\n"
+        f"{sym} {td}\n"
+        f"Reaction score: {sc}/3\n"
+        f"Причина: {extra}\n"
+        f"<b>НЕ вход.</b>"
+    )
+    send_telegram(telegram_token, chat_id, text)
+
+
+def _failure_reason_summary(w):
+    miss = []
+    ch = w["criteria_hit"]
+    if not ch["rejection"]:
+        miss.append("rejection")
+    if not ch["trigger"]:
+        miss.append("trigger candle")
+    if not ch["structure_break"]:
+        miss.append("structure break")
+    if not miss:
+        return "score ≤ 1 после 4 свечей"
+    return "не было: " + " / ".join(miss)
+
+
+def register_reaction_watch_on_zone_hit(coin, zone_dict, asset_row, hit_ts_ms):
+    """Вызывается при ZONE_HIT; не дублирует watch по одному zone_key."""
+    if not OBSERVATION_MODE:
+        return
+    wk = _zone_key(coin, zone_dict)
+    with _reaction_watch_lock:
+        if wk in _active_reaction_watches:
+            return
+    try:
+        candles = fetch_candles(coin, "15m", 200)
+    except Exception as e:
+        print(f"[reaction] 15m fetch for watch: {e}")
+        return
+    pre5 = _last_n_closed_before_hit(hit_ts_ms, candles, 5)
+    if len(pre5) < 5:
+        print(f"[reaction] skip watch {wk}: need 5 closed 15m before hit, got {len(pre5)}")
+        return
+    pre_low = min(c["l"] for c in pre5)
+    pre_high = max(c["h"] for c in pre5)
+    with _reaction_watch_lock:
+        if wk in _active_reaction_watches:
+            return
+        _active_reaction_watches[wk] = {
+            "symbol": coin,
+            "trade_dir": zone_dict["direction"],
+            "zone_low": float(zone_dict["low"]),
+            "zone_high": float(zone_dict["high"]),
+            "hit_ts_ms": int(hit_ts_ms),
+            "zone_hit_price": float(asset_row.get("price") or 0),
+            "pre_hit_local_low_5": pre_low,
+            "pre_hit_local_high_5": pre_high,
+            "criteria_hit": {"rejection": False, "trigger": False, "structure_break": False},
+            "touch_seen": False,
+            "score": 0,
+            "processed_ends": [],
+            "trigger_detail": None,
+            "observation_only": True,
+        }
+
+
+def process_reaction_watches(telegram_token, chat_id):
+    """Каждый цикл сканера: новые закрытые 15m в окне, обновление критериев, финал."""
+    if not OBSERVATION_MODE:
+        return
+    now_ms = int(time.time() * 1000)
+    with _reaction_watch_lock:
+        keys = list(_active_reaction_watches.keys())
+
+    for wk in keys:
+        with _reaction_watch_lock:
+            w = _active_reaction_watches.get(wk)
+        if not w:
+            continue
+        sym = w["symbol"]
+        try:
+            candles = fetch_candles(sym, "15m", 200)
+        except Exception as e:
+            print(f"[reaction] fetch 15m: {e}")
+            continue
+
+        hit_ms = w["hit_ts_ms"]
+        last_before = _last_closed_candles_before(hit_ms, candles)
+        prev_anchor = last_before[-1] if last_before else None
+
+        window = _first_four_closed_after_hit(hit_ms, candles, now_ms)
+        processed_ends = list(w["processed_ends"])
+
+        for i, cur in enumerate(window):
+            end_ms = _candle_end_ms(cur)
+            if end_ms in processed_ends:
+                continue
+            prev = window[i - 1] if i > 0 else prev_anchor
+            patterns = _apply_reaction_candle(w, prev, cur)
+            processed_ends.append(end_ms)
+            w["processed_ends"] = processed_ends
+
+            window_label = f"{len(processed_ends)}/4"
+            st_lvl = (
+                w["pre_hit_local_low_5"] if w["trade_dir"] == "SHORT" else w["pre_hit_local_high_5"]
+            )
+
+            if w["score"] >= 2:
+                status = "OBSERVATION_ONLY_CONFIRMED"
+            elif len(processed_ends) >= REACTION_WINDOW_BARS and w["score"] <= 1:
+                status = "OBSERVATION_ONLY_FAILED"
+            else:
+                status = "OBSERVATION_ONLY_TICK"
+
+            rec = _build_reaction_log_record(
+                w,
+                wk,
+                end_ms,
+                window_label,
+                status,
+                ", ".join(patterns) if patterns else None,
+                st_lvl,
+                cur,
+            )
+            append_reaction_jsonl(rec)
+            _print_reaction(rec)
+
+            if status == "OBSERVATION_ONLY_CONFIRMED":
+                _send_reaction_telegram_confirmed(telegram_token, chat_id, w)
+                with _reaction_watch_lock:
+                    _active_reaction_watches.pop(wk, None)
+                break
+
+            if status == "OBSERVATION_ONLY_FAILED":
+                reason = _failure_reason_summary(w)
+                _send_reaction_telegram_failed(telegram_token, chat_id, w, [reason])
+                with _reaction_watch_lock:
+                    _active_reaction_watches.pop(wk, None)
+                break
 
 
 def fetch_funding():
@@ -1311,9 +1709,11 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                         and (not already_inside)
                         and (now - last_inside_spam >= cd)
                     ):
+                        hit_ts_ms = int(time.time() * 1000)
                         log_signal(self_webhook_url, "ZONE_HIT", r)
                         with _state_lock:
                             _state["last_proximity_alert_at"][spam_key_inside] = now
+                        register_reaction_watch_on_zone_hit(coin, z, r, hit_ts_ms)
                         ok = fire_zone_hit(self_webhook_url, r)
                         if ok:
                             print("WEBHOOK SENT:", coin, "ZONE HIT")
@@ -1378,6 +1778,8 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
                              f"\n<b>Правило</b>:\n"
                              f"- Вход запрещён. Жди ZONE HIT + реакцию.")
                         )
+
+            process_reaction_watches(telegram_token, chat_id)
 
             with _state_lock:
                 _state["inside_zone_keys"] = current_inside_zone_keys
