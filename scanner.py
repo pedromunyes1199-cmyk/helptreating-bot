@@ -68,9 +68,152 @@ DEBUG_ZONE_COOLDOWN_SEC = 30 * 60
 # Автооценка реакции на 15m после ZONE_HIT — только наблюдение, не сигнал и не вход.
 OBSERVATION_MODE = os.getenv("OBSERVATION_MODE", "false").lower() in ("1", "true", "yes")
 
+# Авто-план (Telegram + расчёт) только при A+ и 3/3; для B — выключено по умолчанию.
+AUTO_PLAN_FOR_B = os.getenv("AUTO_PLAN_FOR_B", "false").lower() in ("1", "true", "yes")
+
 _active_reaction_watches: dict = {}
 _reaction_watch_lock = threading.Lock()
 _reaction_log_lock = threading.Lock()
+_auto_plan_log_lock = threading.Lock()
+
+# Буфер стопа для auto plan (не смешивать с зоновой логикой оценки сетапа)
+_AUTO_PLAN_ATR_MIN = {
+    "BTC": (0.5, 0.005),
+    "ETH": (0.5, 0.005),
+    "SOL": (0.8, 0.007),
+}
+RR_TARGET = 2.3
+
+
+def _account_balance_usdc():
+    raw = os.getenv("ACCOUNT_BALANCE", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _risk_pct_for_grade(setup_grade: str) -> float:
+    if setup_grade == "A+":
+        return 0.01
+    if setup_grade == "B":
+        return 0.005
+    return 0.0
+
+
+def _auto_plan_buffer(symbol, entry_ref, atr_1h):
+    atr_mult, min_pct = _AUTO_PLAN_ATR_MIN.get(symbol, (0.5, 0.005))
+    if atr_1h is None or atr_1h <= 0:
+        return None
+    return max(atr_mult * float(atr_1h), min_pct * float(entry_ref))
+
+
+def compute_auto_plan_metrics(symbol, trade_dir, zone_low, zone_high, entry_ref, atr_1h):
+    """
+    Расчёт уровней auto plan (не торговый ордер).
+    Возвращает dict с полями valid, entry_ref, stop_ref, min_tp_for_RR_2_3, risk_per_unit, buffer, rr_target.
+    """
+    zl, zh = float(zone_low), float(zone_high)
+    entry_ref = float(entry_ref)
+    buf = _auto_plan_buffer(symbol, entry_ref, atr_1h)
+    out = {
+        "valid": False,
+        "entry_ref": entry_ref,
+        "stop_ref": None,
+        "min_tp_for_RR_2_3": None,
+        "risk_per_unit": None,
+        "buffer": buf,
+        "rr_target": RR_TARGET,
+    }
+    if buf is None:
+        return out
+
+    if trade_dir == "SHORT":
+        stop_ref = zh + buf
+        risk_per_unit = stop_ref - entry_ref
+        min_tp = entry_ref - risk_per_unit * RR_TARGET
+        ok = stop_ref > entry_ref and min_tp < entry_ref and risk_per_unit > 0
+        out.update(
+            stop_ref=stop_ref,
+            min_tp_for_RR_2_3=min_tp,
+            risk_per_unit=risk_per_unit,
+            valid=bool(ok),
+        )
+    elif trade_dir == "LONG":
+        stop_ref = zl - buf
+        risk_per_unit = entry_ref - stop_ref
+        min_tp = entry_ref + risk_per_unit * RR_TARGET
+        ok = stop_ref < entry_ref and min_tp > entry_ref and risk_per_unit > 0
+        out.update(
+            stop_ref=stop_ref,
+            min_tp_for_RR_2_3=min_tp,
+            risk_per_unit=risk_per_unit,
+            valid=bool(ok),
+        )
+    return out
+
+
+def add_sizing_to_plan(metrics: dict, setup_grade: str, account_balance_usdc):
+    """Добавляет risk_usdc, position_size_usdc, estimated_leverage если задан баланс."""
+    out = dict(metrics)
+    out["risk_usdc"] = None
+    out["position_size_usdc"] = None
+    out["estimated_leverage"] = None
+    out["account_balance_used"] = None
+    if account_balance_usdc is None or account_balance_usdc <= 0:
+        return out
+    if not metrics.get("valid"):
+        out["account_balance_used"] = account_balance_usdc
+        return out
+    rpct = _risk_pct_for_grade(setup_grade)
+    if rpct <= 0:
+        out["account_balance_used"] = account_balance_usdc
+        return out
+    risk_usdc = account_balance_usdc * rpct
+    ru = metrics["risk_per_unit"]
+    entry_ref = metrics["entry_ref"]
+    if ru is None or ru <= 0:
+        out["account_balance_used"] = account_balance_usdc
+        return out
+    pos = risk_usdc / ru * entry_ref
+    lev = pos / account_balance_usdc
+    out["risk_usdc"] = risk_usdc
+    out["position_size_usdc"] = pos
+    out["estimated_leverage"] = lev
+    out["account_balance_used"] = account_balance_usdc
+    return out
+
+
+def _should_emit_auto_plan(w):
+    if w.get("score", 0) < 3:
+        return False
+    sg = w.get("setup_grade", "IGNORE")
+    if sg == "A+":
+        return True
+    if sg == "B" and AUTO_PLAN_FOR_B:
+        return True
+    return False
+
+
+def _auto_plan_log_file_path():
+    state_path = os.environ.get("STATE_PATH", "state.json")
+    abs_state = os.path.abspath(state_path)
+    parent = os.path.dirname(abs_state) or os.getcwd()
+    return os.path.join(parent, "auto_plan_decisions.jsonl")
+
+
+def append_auto_plan_jsonl(record: dict) -> None:
+    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    path = _auto_plan_log_file_path()
+    with _auto_plan_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def _print_auto_plan(record: dict) -> None:
+    print("[auto_plan]", json.dumps(record, ensure_ascii=False, default=str))
 
 # Конфиг фильтров (дефолты = текущее поведение v2; не меняют логику до явной смены env)
 STRICT_TF_ALIGNMENT = os.getenv("STRICT_TF_ALIGNMENT", "true").lower() in ("1", "true", "yes")
@@ -485,11 +628,15 @@ def register_reaction_watch_on_zone_hit(coin, zone_dict, asset_row, hit_ts_ms):
             "zone_hit_price": float(asset_row.get("price") or 0),
             "pre_hit_local_low_5": pre_low,
             "pre_hit_local_high_5": pre_high,
+            "setup_grade": str(asset_row.get("setup_grade", "IGNORE")).upper().strip(),
+            "atr_1h": asset_row.get("atr_1h"),
             "criteria_hit": {"rejection": False, "trigger": False, "structure_break": False},
             "touch_seen": False,
             "score": 0,
             "processed_ends": [],
             "trigger_detail": None,
+            "sent_observation_confirmed": False,
+            "sent_auto_plan": False,
             "observation_only": True,
         }
 
@@ -535,9 +682,7 @@ def process_reaction_watches(telegram_token, chat_id):
                 w["pre_hit_local_low_5"] if w["trade_dir"] == "SHORT" else w["pre_hit_local_high_5"]
             )
 
-            if w["score"] >= 2:
-                status = "OBSERVATION_ONLY_CONFIRMED"
-            elif len(processed_ends) >= REACTION_WINDOW_BARS and w["score"] <= 1:
+            if len(processed_ends) >= REACTION_WINDOW_BARS and w["score"] <= 1:
                 status = "OBSERVATION_ONLY_FAILED"
             else:
                 status = "OBSERVATION_ONLY_TICK"
@@ -555,15 +700,32 @@ def process_reaction_watches(telegram_token, chat_id):
             append_reaction_jsonl(rec)
             _print_reaction(rec)
 
-            if status == "OBSERVATION_ONLY_CONFIRMED":
-                _send_reaction_telegram_confirmed(telegram_token, chat_id, w)
+            # Первое достижение score≥2: 🧪 observation (кроме A+ 3/3 — там только plan)
+            if w["score"] >= 2 and not w.get("sent_observation_confirmed"):
+                skip_obs = w["score"] == 3 and w.get("setup_grade") == "A+" and _should_emit_auto_plan(
+                    w
+                )
+                if not skip_obs:
+                    _send_reaction_telegram_confirmed(telegram_token, chat_id, w)
+                w["sent_observation_confirmed"] = True
+
+            plan_done = False
+            if _should_emit_auto_plan(w) and not w.get("sent_auto_plan"):
+                plan_done = bool(_emit_auto_plan_if_eligible(w, cur, wk, telegram_token, chat_id))
+
+            if len(processed_ends) >= REACTION_WINDOW_BARS and w["score"] <= 1:
+                reason = _failure_reason_summary(w)
+                _send_reaction_telegram_failed(telegram_token, chat_id, w, [reason])
                 with _reaction_watch_lock:
                     _active_reaction_watches.pop(wk, None)
                 break
 
-            if status == "OBSERVATION_ONLY_FAILED":
-                reason = _failure_reason_summary(w)
-                _send_reaction_telegram_failed(telegram_token, chat_id, w, [reason])
+            if plan_done:
+                with _reaction_watch_lock:
+                    _active_reaction_watches.pop(wk, None)
+                break
+
+            if len(processed_ends) >= REACTION_WINDOW_BARS:
                 with _reaction_watch_lock:
                     _active_reaction_watches.pop(wk, None)
                 break
@@ -628,6 +790,135 @@ def atr(candles, period=14):
     for i in range(period + 1, n):
         out[i] = (out[i - 1] * (period - 1) + trs[i]) / period
     return out
+
+
+def _resolve_atr_1h_last(symbol, stored_atr):
+    if stored_atr is not None:
+        try:
+            v = float(stored_atr)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    try:
+        c1h = fetch_candles(symbol, "1h", 80)
+        if len(c1h) < 20:
+            return None
+        s = atr(c1h, 14)
+        if s and s[-1] is not None:
+            return float(s[-1])
+    except Exception as e:
+        print(f"[auto_plan] ATR 1H fallback error: {e}")
+    return None
+
+
+def _emit_auto_plan_if_eligible(w, cur, wk, telegram_token, chat_id):
+    """Telegram + auto_plan_decisions.jsonl; без ордеров и без app.py flow."""
+    if not _should_emit_auto_plan(w) or w.get("sent_auto_plan"):
+        return False
+    sym = w["symbol"]
+    sg = w.get("setup_grade", "IGNORE")
+    atr_v = _resolve_atr_1h_last(sym, w.get("atr_1h"))
+    entry_ref = float(cur["c"])
+    m = compute_auto_plan_metrics(sym, w["trade_dir"], w["zone_low"], w["zone_high"], entry_ref, atr_v)
+    bal = _account_balance_usdc()
+    full = add_sizing_to_plan(m, sg, bal)
+
+    ch = w["criteria_hit"]
+    criteria_txt = (
+        f"rejection: {'✓' if ch['rejection'] else '✗'}, "
+        f"trigger: {'✓' if ch['trigger'] else '✗'}, "
+        f"structure break: {'✓' if ch['structure_break'] else '✗'}"
+    )
+
+    if not full.get("valid"):
+        rec = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym,
+            "direction": w["trade_dir"],
+            "setup_grade": sg,
+            "reaction_score": w.get("score"),
+            "entry_ref": full.get("entry_ref"),
+            "stop_ref": full.get("stop_ref"),
+            "min_tp_for_RR_2_3": full.get("min_tp_for_RR_2_3"),
+            "risk_usdc": full.get("risk_usdc"),
+            "position_size_usdc": full.get("position_size_usdc"),
+            "estimated_leverage": full.get("estimated_leverage"),
+            "account_balance_used": full.get("account_balance_used"),
+            "status": "AUTO_PLAN_INVALID_GEOMETRY",
+            "observation_only": True,
+        }
+        append_auto_plan_jsonl(rec)
+        _print_auto_plan(rec)
+        text = (
+            f"✅ <b>AUTO REACTION CONFIRMED — PLAN READY</b>\n"
+            f"{sym} {w['trade_dir']}\n"
+            f"Setup: <b>{sg}</b> | Reaction score: <b>3/3</b>\n"
+            f"{criteria_txt}\n\n"
+            f"⚠️ Геометрия плана не прошла проверку (stop/tp). Перепроверь уровни на графике.\n\n"
+            f"Это <b>НЕ</b> авто-вход. Бот не открыл сделку. Проверь график и открой руками, если согласен."
+        )
+        send_telegram(telegram_token, chat_id, text)
+        w["sent_auto_plan"] = True
+        return True
+
+    risk_u = full.get("risk_usdc")
+    pos_u = full.get("position_size_usdc")
+    lev = full.get("estimated_leverage")
+    bal_u = full.get("account_balance_used")
+
+    rec_ok = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": sym,
+        "direction": w["trade_dir"],
+        "setup_grade": sg,
+        "reaction_score": 3,
+        "entry_ref": full["entry_ref"],
+        "stop_ref": full["stop_ref"],
+        "min_tp_for_RR_2_3": full["min_tp_for_RR_2_3"],
+        "risk_usdc": risk_u,
+        "position_size_usdc": pos_u,
+        "estimated_leverage": lev,
+        "account_balance_used": bal_u,
+        "status": "AUTO_PLAN_READY_NOT_EXECUTED",
+        "rr_target": RR_TARGET,
+        "buffer": full.get("buffer"),
+        "risk_per_unit": full.get("risk_per_unit"),
+        "watch_key": wk,
+        "observation_only": True,
+    }
+    append_auto_plan_jsonl(rec_ok)
+    _print_auto_plan(rec_ok)
+
+    sz_note = ""
+    if bal_u is not None:
+        sz_note = (
+            f"\n<b>Risk (USDC)</b>: {_fmt_price(risk_u)}\n"
+            f"<b>Position size (USDC)</b>: {_fmt_price(pos_u)}\n"
+            f"<b>Est. leverage</b>: {lev:.2f}x\n"
+            f"<b>Balance used</b>: {_fmt_price(bal_u)}"
+        )
+    else:
+        sz_note = (
+            "\n<i>Sizing не считался: задай ACCOUNT_BALANCE в env для risk/size/leverage.</i>"
+        )
+
+    text_ok = (
+        f"✅ <b>AUTO REACTION CONFIRMED — PLAN READY</b>\n"
+        f"{sym} {w['trade_dir']}\n"
+        f"Setup: <b>{sg}</b> | Reaction score: <b>3/3</b>\n"
+        f"{criteria_txt}\n\n"
+        f"<b>entry_ref</b>: {_fmt_price(full['entry_ref'])}\n"
+        f"<b>stop_ref</b>: {_fmt_price(full['stop_ref'])}\n"
+        f"<b>min_tp (RR≥{RR_TARGET})</b>: {_fmt_price(full['min_tp_for_RR_2_3'])}\n"
+        f"<b>RR</b>: {RR_TARGET} (по min_tp)\n"
+        f"{sz_note}\n\n"
+        f"⚠️ Ордер <b>НЕ</b> открыт. Открывай руками, если согласен.\n"
+        f"Это <b>НЕ</b> авто-вход. Бот не открыл сделку. Проверь график и открой руками, если согласен."
+    )
+    send_telegram(telegram_token, chat_id, text_ok)
+    w["sent_auto_plan"] = True
+    return True
 
 
 def rsi(closes, period=14):
