@@ -35,6 +35,9 @@ DAY_R_LIM      =  3.0
 MAX_TRADES     =  3
 COOLDOWN_MIN   =  15        # минут между алертами по одному активу
 
+# v4.4: Pine Script / сканер — отсев мусорных вебхуков до get_user() / flow (см. webhook)
+PS_IGNORE_STATUSES = {"IGNORE"}
+
 # Торговые окна (UTC): Лондон 08:00-11:00, Нью-Йорк 13:30-16:30
 SESSIONS_UTC   = [(8*60, 11*60), (13*60+30, 16*60+30)]
 
@@ -743,6 +746,14 @@ def webhook():
     ctx_tf    = data.get("context_tf","4H")
     price_raw = data.get("price", data.get("trigger_price", 0))
     price     = format_price(price_raw)
+
+    # v4.4: до get_user()/ensure_user_state, BUSY_STEPS, cooldown — без Telegram
+    decision_state = str(data.get("decision_state", "ZONE_HIT")).upper()
+    smart_status = str(data.get("smart_status", "WATCH")).upper()
+    if smart_status in PS_IGNORE_STATUSES:
+        return jsonify({"status": "filtered", "reason": f"smart_status={smart_status}"})
+    if decision_state == "NO_VALID_ZONE":
+        return jsonify({"status": "filtered", "reason": "NO_VALID_ZONE"})
 
     # ── Поля от scanner v2 (опциональны для обратной совместимости) ──
     scanner_atr_mode = str(data.get("atr_mode") or "").upper() or None

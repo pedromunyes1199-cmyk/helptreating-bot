@@ -2118,8 +2118,10 @@ def fire_zone_hit(self_webhook_url, asset_row):
         "context_tf": "4H",
         "price": asset_row["price"],
         "trigger_price": asset_row["price"],
-        # Расширения v2 — безопасно для api.py (он их не читает)
+        # Расширения v2 — app.py использует для фильтрации (v4.4+)
         "grade": asset_row.get("setup_grade", z.get("grade", "IGNORE")),
+        "smart_status": asset_row.get("smart_status", "IGNORE"),
+        "decision_state": asset_row.get("decision_state", "IGNORE_OTHER"),
         "funding_risk": asset_row["funding_risk"],
         "rsi_dir": asset_row["rsi_dir"],
         "atr_mode": asset_row["atr_mode"],
@@ -2273,11 +2275,13 @@ def _scanner_loop(telegram_token, chat_id, self_webhook_url):
 
                     # Сигнал только на ВХОДЕ в зону (FAR/NEAR -> INSIDE). Пока цена внутри — не спамим.
                     # Плюс кулдаун на пару (symbol, zone, INSIDE), чтобы не дублировать чаще 30–60 мин.
+                    # v4.4: fire только если setup валидный (ACTION или READY) — не шлём IGNORE сетапы
                     if (
                         inside
                         and warmup_done
                         and (not already_inside)
                         and (now - last_inside_spam >= cd)
+                        and r.get("smart_status") in ("ACTION", "READY")
                     ):
                         hit_ts_ms = int(time.time() * 1000)
                         log_signal(self_webhook_url, "ZONE_HIT", r)
